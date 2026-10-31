@@ -1,0 +1,561 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>RP2350 DS5-Bridge · 500Hz 二段式 L2 强开陀螺仪瞄准控制台</title>
+<style>
+  :root {
+    --bg: #0b0f17;
+    --panel: #131b29;
+    --border: #223049;
+    --cyan: #00d2ff;
+    --red: #ff2244;
+    --amber: #ffaa00;
+    --green: #00e676;
+    --text: #e6edf7;
+    --muted: #8b9bb4;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    background: var(--bg);
+    color: var(--text);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Microsoft YaHei", sans-serif;
+    padding: 18px 24px;
+    user-select: none;
+  }
+  header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    padding: 14px 20px;
+    background: linear-gradient(90deg, #111a2b, #17233b);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    margin-bottom: 16px;
+  }
+  .title-box h1 {
+    font-size: 20px;
+    font-weight: 700;
+    letter-spacing: 0.5px;
+    display: flex;
+    align-items: center;
+    gap: 10px;
+  }
+  .title-box p {
+    font-size: 12.5px;
+    color: var(--muted);
+    margin-top: 4px;
+  }
+  .status-pills {
+    display: flex;
+    gap: 12px;
+    align-items: center;
+  }
+  .pill {
+    padding: 6px 14px;
+    border-radius: 999px;
+    font-size: 13px;
+    font-weight: 600;
+    background: #1a253a;
+    border: 1px solid var(--border);
+  }
+  .pill.active-gyro {
+    background: rgba(255, 34, 68, 0.22);
+    border-color: var(--red);
+    color: #ff6b81;
+    box-shadow: 0 0 18px rgba(255, 34, 68, 0.45);
+  }
+  .pill.standby-gyro {
+    background: rgba(0, 210, 255, 0.14);
+    border-color: var(--cyan);
+    color: var(--cyan);
+  }
+
+  .grid {
+    display: grid;
+    grid-template-columns: 1.15fr 1fr;
+    gap: 16px;
+  }
+  .card {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 16px 18px;
+  }
+  .card h2 {
+    font-size: 15px;
+    margin-bottom: 12px;
+    color: #b8c7e0;
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+  }
+
+  /* L2 Two-Stage Gauge */
+  .trigger-wrap {
+    margin-bottom: 16px;
+  }
+  .trigger-bar-outer {
+    position: relative;
+    height: 36px;
+    background: #090d14;
+    border: 1px solid #2b3c5a;
+    border-radius: 8px;
+    overflow: hidden;
+  }
+  .trigger-wall-zone {
+    position: absolute;
+    top: 0;
+    bottom: 0;
+    background: repeating-linear-gradient(
+      45deg,
+      rgba(255, 170, 0, 0.18),
+      rgba(255, 170, 0, 0.18) 6px,
+      rgba(255, 170, 0, 0.34) 6px,
+      rgba(255, 170, 0, 0.34) 12px
+    );
+    border-left: 2px dashed var(--amber);
+    border-right: 2px dashed var(--amber);
+    z-index: 2;
+  }
+  .trigger-thresh-line {
+    position: absolute;
+    top: 0;
+    bottom: 0;
+    width: 3px;
+    background: var(--red);
+    box-shadow: 0 0 10px var(--red);
+    z-index: 4;
+  }
+  .trigger-fill {
+    position: absolute;
+    top: 0;
+    left: 0;
+    bottom: 0;
+    width: 0%;
+    background: linear-gradient(90deg, #0072ff, #00d2ff);
+    transition: width 0.02s linear;
+    z-index: 1;
+  }
+  .trigger-fill.engaged {
+    background: linear-gradient(90deg, #ff6a00, #ff1e38);
+  }
+  .trigger-labels {
+    display: flex;
+    justify-content: space-between;
+    font-size: 12px;
+    color: var(--muted);
+    margin-top: 6px;
+  }
+
+  /* Target Range Canvas */
+  #rangeCanvas {
+    width: 100%;
+    height: 290px;
+    background: radial-gradient(circle at center, #152238 0%, #090e17 100%);
+    border: 1px solid #2b3e5e;
+    border-radius: 10px;
+    cursor: crosshair;
+    display: block;
+  }
+
+  /* Sliders & Controls */
+  .ctrl-row {
+    display: grid;
+    grid-template-columns: 155px 1fr 62px;
+    align-items: center;
+    gap: 10px;
+    margin-bottom: 11px;
+    font-size: 13px;
+  }
+  .ctrl-row input[type="range"] {
+    width: 100%;
+    accent-color: var(--cyan);
+    cursor: pointer;
+  }
+  .val-tag {
+    text-align: right;
+    font-family: Consolas, monospace;
+    color: var(--cyan);
+    font-weight: 600;
+  }
+  .btn-row {
+    display: flex;
+    gap: 10px;
+    margin-top: 12px;
+    flex-wrap: wrap;
+  }
+  button {
+    background: #1e2d46;
+    color: var(--text);
+    border: 1px solid #354d73;
+    padding: 8px 14px;
+    border-radius: 8px;
+    font-size: 13px;
+    font-weight: 600;
+    cursor: pointer;
+    transition: 0.15s;
+  }
+  button:hover {
+    background: #283c5e;
+    border-color: var(--cyan);
+  }
+  button.primary {
+    background: linear-gradient(90deg, #0066ff, #00b4ff);
+    border: none;
+    color: #fff;
+  }
+  .telemetry-grid {
+    display: grid;
+    grid-template-columns: repeat(4, 1fr);
+    gap: 8px;
+    margin-top: 12px;
+  }
+  .stat-box {
+    background: #0c121d;
+    border: 1px solid #1f2d44;
+    border-radius: 8px;
+    padding: 8px 10px;
+    text-align: center;
+  }
+  .stat-box .k { font-size: 11px; color: var(--muted); }
+  .stat-box .v { font-size: 15px; font-weight: 700; font-family: Consolas, monospace; margin-top: 2px; }
+</style>
+</head>
+<body>
+
+<header>
+  <div class="title-box">
+    <h1>🎮 RP2350 DS5-Bridge · 二段式 L2 强开陀螺仪瞄准引擎 (Route A)</h1>
+    <p>轻按 L2 常规摇杆开镜 · 使劲按到底突破自适应扳机阻尼墙 (L2 ≥ 阈值) 瞬时激活 500Hz 亚像素陀螺仪鼠标压枪</p>
+  </div>
+  <div class="status-pills">
+    <div id="connPill" class="pill">正在检测 DS5-Bridge...</div>
+    <div id="ratePill" class="pill">0.0 Hz</div>
+    <div id="modePill" class="pill standby-gyro">STANDBY · 陀螺仪待机</div>
+  </div>
+</header>
+
+<div class="grid">
+  <!-- Left Column: Live L2 Two-Stage Visualizer & Target Practice Range -->
+  <div class="card">
+    <h2>
+      <span>🎯 实时 L2 二段式自适应扳机行程 & 压枪靶场 (按 R2 扳机或鼠标左键开火)</span>
+      <span id="scoreText" style="color: var(--green); font-family: Consolas;">命中: 0</span>
+    </h2>
+
+    <div class="trigger-wrap">
+      <div class="trigger-bar-outer">
+        <div id="wallZone" class="trigger-wall-zone" title="L2 自适应扳机物理阻尼墙"></div>
+        <div id="threshLine" class="trigger-thresh-line" title="L2 强开陀螺仪触发线"></div>
+        <div id="l2Fill" class="trigger-fill"></div>
+      </div>
+      <div class="trigger-labels">
+        <span>0 (松开)</span>
+        <span style="color: var(--cyan);">一段轻按：常规开镜 (摇杆粗瞄)</span>
+        <span style="color: var(--amber);">⚡ 二段物理阻尼墙 (135~185)</span>
+        <span style="color: var(--red); font-weight:700;">🔥 重按到底 (≥195)：强开陀螺仪！</span>
+      </div>
+    </div>
+
+    <canvas id="rangeCanvas" width="680" height="290"></canvas>
+
+    <div class="telemetry-grid">
+      <div class="stat-box">
+        <div class="k">L2 / R2 行程 (0-255)</div>
+        <div class="v" id="valL2R2">0 / 0</div>
+      </div>
+      <div class="stat-box">
+        <div class="k">Pitch 俯仰 (gx)</div>
+        <div class="v" id="valGx">0.0</div>
+      </div>
+      <div class="stat-box">
+        <div class="k">Yaw 偏航 (gy)</div>
+        <div class="v" id="valGy">0.0</div>
+      </div>
+      <div class="stat-box">
+        <div class="k">亚像素输出 (dx, dy)</div>
+        <div class="v" id="valDxDy">0.0, 0.0</div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Right Column: Live Tuning Controls -->
+  <div class="card">
+    <h2>⚙️ 实时硬件手感与滤波算法调参（修改即刻同步至手柄）</h2>
+
+    <div class="ctrl-row">
+      <label>L2 强开触发阈值</label>
+      <input type="range" id="sl_l2_threshold" min="30" max="250" step="1" value="195">
+      <span class="val-tag" id="lb_l2_threshold">195</span>
+    </div>
+
+    <div class="ctrl-row">
+      <label>L2 物理阻尼墙起点</label>
+      <input type="range" id="sl_wall_start" min="20" max="210" step="1" value="135">
+      <span class="val-tag" id="lb_wall_start">135</span>
+    </div>
+
+    <div class="ctrl-row">
+      <label>L2 物理阻尼墙力度</label>
+      <input type="range" id="sl_wall_force" min="0" max="255" step="1" value="235">
+      <span class="val-tag" id="lb_wall_force">235</span>
+    </div>
+
+    <hr style="border:none; border-top:1px solid var(--border); margin: 12px 0;">
+
+    <div class="ctrl-row">
+      <label>水平灵敏度 (Sens X)</label>
+      <input type="range" id="sl_sens_x" min="0.002" max="0.060" step="0.001" value="0.018">
+      <span class="val-tag" id="lb_sens_x">0.018</span>
+    </div>
+
+    <div class="ctrl-row">
+      <label>垂直灵敏度 (Sens Y)</label>
+      <input type="range" id="sl_sens_y" min="0.002" max="0.060" step="0.001" value="0.015">
+      <span class="val-tag" id="lb_sens_y">0.015</span>
+    </div>
+
+    <div class="ctrl-row">
+      <label>横滚融合比 (Yaw+Roll)</label>
+      <input type="range" id="sl_yaw_roll_mix" min="0.0" max="1.0" step="0.05" value="0.35">
+      <span class="val-tag" id="lb_yaw_roll_mix">0.35</span>
+    </div>
+
+    <div class="ctrl-row">
+      <label>死区消抖阈值 (Deadzone)</label>
+      <input type="range" id="sl_deadzone" min="0.0" max="35.0" step="0.5" value="8.0">
+      <span class="val-tag" id="lb_deadzone">8.0</span>
+    </div>
+
+    <div class="ctrl-row">
+      <label>EMA 滤波响应系数 α</label>
+      <input type="range" id="sl_ema_alpha" min="0.10" max="1.00" step="0.05" value="0.65">
+      <span class="val-tag" id="lb_ema_alpha">0.65</span>
+    </div>
+
+    <div class="btn-row">
+      <button class="primary" onclick="triggerCalibrate()">🧭 手柄平放一键校准零偏</button>
+      <button id="btnWall" onclick="toggleBool('wall_enabled')">🔒 二段物理阻尼墙: 开启</button>
+      <button id="btnInvX" onclick="toggleBool('invert_x')">↔️ 反转水平X: 关</button>
+      <button id="btnInvY" onclick="toggleBool('invert_y')">↕️ 反转垂直Y: 关</button>
+      <button id="btnAlways" onclick="toggleBool('always_on_test')">🧪 免按L2常开测试: 关</button>
+    </div>
+
+    <div style="margin-top: 14px; padding: 10px 12px; background:#0d1422; border-radius:8px; border:1px solid #22324d; font-size:12.5px; color:#9ab0d0; line-height:1.6;">
+      💡 <b>使用秘籍</b>：<br>
+      1. 现在拿起你的 PS5 手柄，慢慢扣动 <b>L2 扳机</b>，你会感觉到在约 55% 行程处有一道明显的<b>物理机械阻尼墙</b>（此时灯条为冰蓝色，陀螺仪不介入）。<br>
+      2. <b>使劲按穿这道阻尼墙到底 (L2 ≥ 195)</b>：手柄灯条瞬间变为<b>锁定红</b>，全部 5 颗指示灯亮起，此时转动手腕即可 500Hz 控制鼠标准星！在左上方靶场扣动 <b>R2</b> 即可开火打靶！
+    </div>
+  </div>
+</div>
+
+<script>
+let currentCfg = {};
+let lastR2Shot = false;
+let hits = 0;
+
+// Target Range State
+const canvas = document.getElementById('rangeCanvas');
+const ctx = canvas.getContext('2d');
+let mouseX = canvas.width / 2;
+let mouseY = canvas.height / 2;
+let target = { x: 340, y: 145, r: 24 };
+let ripples = [];
+
+canvas.addEventListener('mousemove', (e) => {
+  const rect = canvas.getBoundingClientRect();
+  mouseX = (e.clientX - rect.left) * (canvas.width / rect.width);
+  mouseY = (e.clientY - rect.top) * (canvas.height / rect.height);
+});
+
+canvas.addEventListener('mousedown', () => fireShot());
+
+function spawnTarget() {
+  target.x = 60 + Math.random() * (canvas.width - 120);
+  target.y = 45 + Math.random() * (canvas.height - 90);
+}
+
+function fireShot() {
+  const dist = Math.hypot(mouseX - target.x, mouseY - target.y);
+  const hit = dist <= target.r + 6;
+  ripples.push({ x: mouseX, y: mouseY, r: 4, hit: hit, alpha: 1.0 });
+  if (hit) {
+    hits++;
+    document.getElementById('scoreText').textContent = `命中: ${hits}`;
+    spawnTarget();
+  }
+}
+
+function drawRange(telemetry) {
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+  // Grid lines
+  ctx.strokeStyle = 'rgba(45, 70, 110, 0.25)';
+  ctx.lineWidth = 1;
+  for (let x = 0; x < canvas.width; x += 40) {
+    ctx.beginPath(); ctx.moveTo(x, 0); ctx.lineTo(x, canvas.height); ctx.stroke();
+  }
+  for (let y = 0; y < canvas.height; y += 40) {
+    ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(canvas.width, y); ctx.stroke();
+  }
+
+  // Draw target
+  ctx.beginPath();
+  ctx.arc(target.x, target.y, target.r, 0, Math.PI * 2);
+  ctx.fillStyle = 'rgba(255, 34, 68, 0.28)';
+  ctx.fill();
+  ctx.lineWidth = 2.5;
+  ctx.strokeStyle = '#ff2244';
+  ctx.stroke();
+
+  ctx.beginPath();
+  ctx.arc(target.x, target.y, 6, 0, Math.PI * 2);
+  ctx.fillStyle = '#ffaa00';
+  ctx.fill();
+
+  // Draw ripples
+  for (let i = ripples.length - 1; i >= 0; i--) {
+    const rp = ripples[i];
+    ctx.beginPath();
+    ctx.arc(rp.x, rp.y, rp.r, 0, Math.PI * 2);
+    ctx.strokeStyle = rp.hit ? `rgba(0, 230, 118, ${rp.alpha})` : `rgba(255, 170, 0, ${rp.alpha})`;
+    ctx.lineWidth = 2;
+    ctx.stroke();
+    rp.r += 2.2;
+    rp.alpha -= 0.06;
+    if (rp.alpha <= 0) ripples.splice(i, 1);
+  }
+
+  // Draw crosshair at mouseX, mouseY
+  const active = telemetry && telemetry.gyro_active;
+  ctx.strokeStyle = active ? '#00e676' : '#00d2ff';
+  ctx.lineWidth = 2;
+  ctx.beginPath();
+  ctx.arc(mouseX, mouseY, 12, 0, Math.PI * 2);
+  ctx.stroke();
+  ctx.beginPath();
+  ctx.moveTo(mouseX - 18, mouseY); ctx.lineTo(mouseX + 18, mouseY);
+  ctx.moveTo(mouseX, mouseY - 18); ctx.lineTo(mouseX, mouseY + 18);
+  ctx.stroke();
+}
+
+const SLIDER_KEYS = [
+  'l2_threshold', 'wall_start', 'wall_force',
+  'sens_x', 'sens_y', 'yaw_roll_mix', 'deadzone', 'ema_alpha'
+];
+
+SLIDER_KEYS.forEach(k => {
+  const el = document.getElementById('sl_' + k);
+  const lb = document.getElementById('lb_' + k);
+  el.addEventListener('input', () => {
+    const v = parseFloat(el.value);
+    lb.textContent = el.step.includes('.') ? v.toFixed(el.step.split('.')[1].length) : v;
+    const patch = {};
+    patch[k] = v;
+    if (k === 'wall_start') {
+      patch['wall_end'] = Math.min(250, v + 50);
+    }
+    sendConfig(patch);
+  });
+});
+
+async function sendConfig(patch) {
+  try {
+    await fetch('/api/config', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(patch)
+    });
+  } catch (e) {}
+}
+
+async function triggerCalibrate() {
+  await fetch('/api/calibrate', { method: 'POST' });
+}
+
+function toggleBool(key) {
+  const next = !currentCfg[key];
+  currentCfg[key] = next;
+  sendConfig({ [key]: next });
+}
+
+let initializedSliders = false;
+
+async function pollState() {
+  try {
+    const res = await fetch('/api/state');
+    const data = await res.json();
+    const { config, telemetry } = data;
+    currentCfg = config;
+
+    if (!initializedSliders) {
+      SLIDER_KEYS.forEach(k => {
+        if (config[k] !== undefined) {
+          const el = document.getElementById('sl_' + k);
+          const lb = document.getElementById('lb_' + k);
+          el.value = config[k];
+          lb.textContent = config[k];
+        }
+      });
+      initializedSliders = true;
+    }
+
+    // Update buttons
+    document.getElementById('btnWall').textContent = `🔒 二段物理阻尼墙: ${config.wall_enabled ? '开启' : '关闭'}`;
+    document.getElementById('btnInvX').textContent = `↔️ 反转水平X: ${config.invert_x ? '开' : '关'}`;
+    document.getElementById('btnInvY').textContent = `↕️ 反转垂直Y: ${config.invert_y ? '开' : '关'}`;
+    document.getElementById('btnAlways').textContent = `🧪 免按L2常开测试: ${config.always_on_test ? '开' : '关'}`;
+
+    // Update Header Pills
+    const connPill = document.getElementById('connPill');
+    connPill.textContent = telemetry.connected ? '✅ DS5-Bridge 已连接' : '❌ 未检测到手柄';
+    document.getElementById('ratePill').textContent = `${telemetry.polling_hz.toFixed(1)} Hz`;
+
+    const modePill = document.getElementById('modePill');
+    if (telemetry.gyro_active) {
+      modePill.className = 'pill active-gyro';
+      modePill.textContent = '🔥 GYRO ENGAGED · 强开陀螺仪瞄准中!';
+    } else {
+      modePill.className = 'pill standby-gyro';
+      modePill.textContent = '❄️ STANDBY · 轻按常规模式';
+    }
+
+    // Update L2 Bar & Zones
+    const l2Pct = (telemetry.l2_raw / 255) * 100;
+    const fill = document.getElementById('l2Fill');
+    fill.style.width = `${l2Pct}%`;
+    fill.className = telemetry.gyro_active ? 'trigger-fill engaged' : 'trigger-fill';
+
+    const wallZone = document.getElementById('wallZone');
+    wallZone.style.left = `${(config.wall_start / 255) * 100}%`;
+    wallZone.style.width = `${((config.wall_end - config.wall_start) / 255) * 100}%`;
+    wallZone.style.display = config.wall_enabled ? 'block' : 'none';
+
+    const threshLine = document.getElementById('threshLine');
+    threshLine.style.left = `${(config.l2_threshold / 255) * 100}%`;
+
+    // Telemetry boxes
+    document.getElementById('valL2R2').textContent = `${telemetry.l2_raw} / ${telemetry.r2_raw}`;
+    document.getElementById('valGx').textContent = telemetry.gx.toFixed(1);
+    document.getElementById('valGy').textContent = telemetry.gy.toFixed(1);
+    document.getElementById('valDxDy').textContent = `${telemetry.dx_accum.toFixed(1)}, ${telemetry.dy_accum.toFixed(1)}`;
+
+    // R2 trigger fires shot in target practice!
+    if (telemetry.r2_raw >= 120 && !lastR2Shot) {
+      lastR2Shot = true;
+      fireShot();
+    } else if (telemetry.r2_raw < 80) {
+      lastR2Shot = false;
+    }
+
+    drawRange(telemetry);
+  } catch (e) {}
+  requestAnimationFrame(pollState);
+}
+
+requestAnimationFrame(pollState);
+</script>
+</body>
+</html>
