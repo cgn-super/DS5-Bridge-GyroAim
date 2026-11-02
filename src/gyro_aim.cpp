@@ -13,6 +13,10 @@
 //   4. Angular velocity (yaw [+ roll mix], pitch) -> radial soft deadzone ->
 //      normalised stick deflection (GA_FULL_SCALE_LSB == full deflection).
 //   5. Light EMA smoothing + radial anti-deadzone + additive Right Stick clamp.
+//   6. Host Auto-Boost Hook (host_boost_hook_apply):
+//      Signals the PC-side MSI Cooler Boost & RAMMap cleaner via the unused UNK2
+//      field (0xA5..0xAF) in standard HID Input Report 0x01 on initial link and
+//      when pressing L3 + R3 + L1 + R1 (with Ice Cyan lightbar confirmation).
 //
 
 #include "gyro_aim.h"
@@ -82,6 +86,12 @@ static uint8_t saved_led_b = 0x00;
 static bool game_has_custom_l2 = false;
 static bool wall_armed_on_boot = false;
 
+// Host Auto-Boost & Memory Clean Hook state (signals PC daemon via unused UNK2 byte 0xA5..0xAF)
+static uint16_t boost_hook_frames = 0;
+static uint8_t boost_hook_seq = 0x05;
+static bool boost_combo_latch = false;
+static bool boost_led_active = false;
+
 static inline float clampf(float v, float lo, float hi) {
     return v < lo ? lo : (v > hi ? hi : v);
 }
@@ -104,6 +114,38 @@ static void send_gyro_led_and_wall(uint8_t r, uint8_t g, uint8_t b) {
         fill_default_l2_wall(state);
     }
     update_state(state);
+}
+
+void __not_in_flash_func(host_boost_hook_apply)(USBGetStateData &r) {
+    const bool combo_now = (r.ButtonL3 && r.ButtonR3 && r.ButtonL1 && r.ButtonR1);
+    if (combo_now) {
+        r.ButtonL3 = 0;
+        r.ButtonR3 = 0;
+        r.ButtonL1 = 0;
+        r.ButtonR1 = 0;
+        if (!boost_combo_latch) {
+            boost_combo_latch = true;
+            boost_hook_seq = (uint8_t)(((boost_hook_seq + 1) & 0x0F) | 0x01);
+            boost_hook_frames = 300; // ~0.6s pulse at 500Hz
+            boost_led_active = true;
+            send_gyro_led_and_wall(0, 240, 255); // Ice Cyan visual confirmation
+        }
+    } else {
+        boost_combo_latch = false;
+    }
+
+    if (boost_hook_frames > 0) {
+        r.UNK2 = (uint8_t)(0xA0 | (boost_hook_seq & 0x0F));
+        --boost_hook_frames;
+        if (boost_hook_frames == 0 && boost_led_active) {
+            boost_led_active = false;
+            if (engaged) {
+                send_gyro_led_and_wall(255, 20, 40);
+            } else {
+                send_gyro_led_and_wall(saved_led_r, saved_led_g, saved_led_b);
+            }
+        }
+    }
 }
 
 void gyro_aim_on_host_output_report(SetStateData &state) {
@@ -135,7 +177,7 @@ void __not_in_flash_func(gyro_aim_apply)(USBGetStateData &r) {
     const float yaw = (float) r.AngularVelocityZ;
     const float roll = (float) r.AngularVelocityY;
 
-    // ---- 1. bias tracking & initial L2 wall arming ----
+    // ---- 1. bias tracking & initial L2 wall + Host Auto-Boost Hook arming ----
     if (!bias_seeded) {
         bias_pitch = pitch;
         bias_yaw = yaw;
@@ -144,8 +186,11 @@ void __not_in_flash_func(gyro_aim_apply)(USBGetStateData &r) {
     }
     if (!wall_armed_on_boot && r.SensorTimestamp > 0) {
         wall_armed_on_boot = true;
+        boost_hook_frames = 500; // ~1.0s initial auto-boost signal pulse on controller link
         send_gyro_led_and_wall(saved_led_r, saved_led_g, saved_led_b);
     }
+
+    host_boost_hook_apply(r);
 
     const float dp = pitch - bias_pitch, dy = yaw - bias_yaw, dr = roll - bias_roll;
     const bool still = fabsf(dp) < 40.0f && fabsf(dy) < 40.0f && fabsf(dr) < 40.0f;

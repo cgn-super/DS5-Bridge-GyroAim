@@ -27,15 +27,21 @@
    - **R2 右扳机开火特效** 100% 直通给游戏；
    - 若进入支持原生 L2 特效的索尼大作，芯片智能识别并让位给游戏；待游戏松开特效后自动挂载二段段落墙。
 
+4. **微星雷影 17 (MSI Alpha 17) 插入自动狂暴风扇 & RAMMap 内存清理 Hook（100% 反作弊安全）**：
+   - **固件内嵌无感 Hook（`host_boost_hook_apply`）**：不增加任何额外 USB 接口，利用标准 HID `0x01` 报告的 `UNK2` 保留字节在手柄连接时及按下 **`L3 + R3 + L1 + R1`** 组合键时发送触发脉冲（手柄灯条闪烁冰蓝色确认）；
+   - **零内核驱动风险**：PC 侧守护脚本 `tools/ds5_msi_auto_boost.py` 直接通过微星原厂正版签名服务 `MSI.CentralServer.exe`（本地 TCP IPC）开启 **Cooler Boost 满速风扇**，绝不加载 `WinRing0` 等高危第三方驱动；
+   - **安全白名单杀后台 + 微软官方 RAMMap 联动**：自动清理高占用闲置后台进程，并调用微软 Sysinternals `RAMMap-64bit.exe` (`-Ew / -Et`) 释放物理内存工作集与备用列表；拔出接收器可自动恢复风扇自动温控。
+
 ### 📁 目录结构
 
 * `firmware/`
   * `ds5-bridge-v0.7.2-gyroL2.uf2`：即刷即用的最终定制固件。
   * `ds5-bridge-v0.7.2-official-stock.uf2`：官方原版固件，便于随时刷回出厂。
 * `src/`
-  * `gyro_aim.h` & `gyro_aim.cpp`：500Hz 陀螺仪姿态解算与二段阻尼发生器核心 C++ 源码。
+  * `gyro_aim.h` & `gyro_aim.cpp`：500Hz 陀螺仪姿态解算、二段阻尼发生器与主机狂暴联动 Hook (`host_boost_hook_apply`) 核心 C++ 源码。
   * `patch_against_official_v0.7.2.patch`：对官方 `DS5Dongle v0.7.2` 的一键 Git 补丁。
 * `tools/`
+  * `ds5_msi_auto_boost.py` & `start_msi_auto_boost.bat`：微星雷影 17 自动满速风扇 (Cooler Boost) + 杀闲置后台 + RAMMap 物理内存释放守护工具。
   * `ds5_gyro_stick_check.py`：实时右摇杆与陀螺仪数值检测工具。
   * `ds5_gyro_hud.html` & `ds5_gyro_mouse_mode_engine.py`：PC 端高精压枪靶场与可视化调参工具。
 
@@ -57,12 +63,16 @@ Custom firmware for Raspberry Pi Pico 2 W (`RP2350`) acting as an ultra-low-late
 2. **Native Hardware Gyro-to-Right-Stick Fusion**:
    - The gyro angular rate is processed on-chip via **zero-bias auto-calibration + radial continuous soft deadzone + EMA smoothing + 18% radial anti-deadzone boost**, and added directly to `RightStickX / RightStickY`.
    - Windows recognizes the device as **a single genuine wired DualSense controller** (`VID: 054C, PID: 0CE6`).
-   - **Zero PC background processes, anti-cheat safe, no input flickering** caused by simultaneous gamepad/mouse inputs.
+   - **Zero PC background processes required for aiming, anti-cheat safe, no input flickering** caused by simultaneous gamepad/mouse inputs.
 
 3. **Zero Impact on Native PS5 Controller Features**:
    - **HD Haptics (dual voice-coil haptic motors)** and controller audio stream untouched through the native USB audio interface.
    - **R2 trigger effects** remain 100% under the game's control.
    - When playing official games that send custom L2 adaptive effects, the firmware automatically yields; once the game releases L2, the two-stage wall automatically rearms.
+
+4. **MSI Alpha 17 Auto Cooler Boost & RAMMap Memory Cleaner Hook (100% Anti-Cheat Safe)**:
+   - **In-Band Firmware Hook (`host_boost_hook_apply`)**: Uses the reserved `UNK2` byte in standard HID Input Report `0x01` without adding any extra USB endpoints. Signals on initial controller link and whenever **`L3 + R3 + L1 + R1`** is pressed (with an Ice Cyan lightbar flash).
+   - **Driverless Fan Control & Memory Purge**: `tools/ds5_msi_auto_boost.py` communicates with the official signed `MSI.CentralServer.exe` local TCP IPC to enable maximum fan speed (**Cooler Boost ON**), terminates whitelisted background bloatware, and invokes Microsoft Sysinternals `RAMMap-64bit.exe` (`-Ew / -Et`) to free physical RAM.
 
 ---
 
@@ -81,11 +91,14 @@ Raspberry Pi Pico 2 W (`RP2350`) を使用し、PS5 DualSense / DualSense Edge �
 2. **ハードウェア直接マッピング（ジャイロ → 右スティック）**：
    - 取得した角速度は、マイコン内部で**ゼロ点自動補正 ＋ 連続ソフトデッドゾーン ＋ EMA スムージング ＋ 18% ラジアル反デッドゾーン補正**を経て、右スティック（`RightStickX / RightStickY`）へ直接合成されます。
    - PC 側からは**正真正銘の純正 PS5 有線コントローラー**として認識されます。
-   - **PC 側常駐ソフト不要・チート対策（アンチチート）安全・ゲーム内のキーマウ/パッド表示のチラつきなし**！
+   - **チート対策（アンチチート）安全・ゲーム内のキーマウ/パッド表示のチラつきなし**！
 
 3. **PS5 純正機能（HDハプティクス / トリガー）との完全両立**：
    - **HD ハプティクス（繊細な触覚振動）**やコントローラースピーカーは独立した USB オーディオ経路を通るため、一切劣化しません。
    - **R2（射撃トリガー）**のゲーム側エフェクトは 100% そのまま機能します。
+
+4. **MSI Alpha 17 自動 Cooler Boost ＆ RAMMap メモリ解放フック**：
+   - 接続時および **`L3 + R3 + L1 + R1`** 同時押し時に、MSI 公式 IPC 経由でファンを最大回転（Cooler Boost）に切り替え、Microsoft 公式 `RAMMap` と連携して物理メモリを自動解放します。
 
 ---
 
@@ -104,11 +117,14 @@ Firmware personalizado para Raspberry Pi Pico 2 W (`RP2350`) que funciona como u
 2. **Fusión de Giroscopio a Stick Derecho en Hardware (Gyro-to-Right-Stick)**:
    - La velocidad angular del giroscopio se filtra en el propio chip con **calibración de deriva cero + zona muerta radial suave + suavizado EMA + compensación de zona muerta del 18%**, inyectándose directamente en `RightStickX / RightStickY`.
    - El PC detecta el dispositivo como un **mando DualSense original con cable** (`VID: 054C, PID: 0CE6`).
-   - **Sin software en segundo plano, seguro contra antitrampas (anti-cheat safe) y sin parpadeos de interfaz** por conflicto entre ratón y mando.
+   - **Seguro contra antitrampas (anti-cheat safe) y sin parpadeos de interfaz** por conflicto entre ratón y mando.
 
 3. **Compatibilidad Total con Funciones Nativas**:
    - La **vibración háptica HD** y el altavoz del mando pasan intactos por la interfaz de audio USB nativa.
    - El gatillo derecho **R2** mantiene íntegros todos los efectos adaptativos del juego.
+
+4. **Hook Automático de Cooler Boost (MSI Alpha 17) y Limpieza de Memoria RAMMap**:
+   - Activa automáticamente los ventiladores al máximo (Cooler Boost) mediante el IPC oficial de MSI Center y libera memoria RAM física con Microsoft `RAMMap` al conectar el receptor o pulsar **`L3 + R3 + L1 + R1`**.
 
 ---
 
@@ -127,11 +143,14 @@ Firmware sur mesure pour Raspberry Pi Pico 2 W (`RP2350`) servant de pont sans f
 2. **Injection Matérielle du Gyroscope vers le Joystick Droit**:
    - La vitesse angulaire du gyroscope est traitée directement sur le microcontrôleur via **autocalibrage du biais zéro + zone morte radiale progressive + lissage EMA + compensation de zone morte de 18%**, puis injectée dans `RightStickX / RightStickY`.
    - Windows ne voit qu'une **authentique manette filaire officielle DualSense** (`VID: 054C, PID: 0CE6`).
-   - **Aucun logiciel en tâche de fond sur PC, sans risque de ban anti-triche, et aucune saccade d'interface** causée par un conflit manette/souris.
+   - **Sans risque de ban anti-triche, et aucune saccade d'interface** causée par un conflit manette/souris.
 
 3. **Préservation Totale des Technologies PS5 Natives**:
    - Les **retours haptiques HD** et le haut-parleur intégré sont préservés à 100% via le canal audio USB dédié.
    - La gâchette droite **R2** conserve intacts tous les effets de tir envoyés par le jeu.
+
+4. **Hook Automatique Cooler Boost (MSI Alpha 17) & Purge Mémoire RAMMap**:
+   - Déclenche automatiquement la vitesse maximale des ventilateurs via l'IPC officiel MSI Center et libère la mémoire vive avec Microsoft `RAMMap` dès la connexion ou via le raccourci **`L3 + R3 + L1 + R1`**.
 
 ---
 
@@ -149,6 +168,19 @@ git apply patch_against_official_v0.7.2.patch
 # Build using Ninja & ARM Toolchain
 cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
 cmake --build build -j 16
+```
+
+## 🚀 MSI Alpha 17 (微星雷影17) 自动风扇 & 内存清理守护用法
+
+```powershell
+# 方式 1：直接双击运行（自动申请管理员权限以支持 RAMMap 静默释放内存，拔出接收器自动恢复风扇温控）
+tools\start_msi_auto_boost.bat
+
+# 方式 2：终端单次立即执行（风扇拉满 6486 RPM + 杀闲置后台 + RAMMap 清理后退出）
+python tools\ds5_msi_auto_boost.py --once --uac-rammap
+
+# 方式 3：将风扇恢复为自动温控模式 (Cooler Boost OFF)
+python tools\ds5_msi_auto_boost.py --fan-auto
 ```
 
 ## 📜 License / 开源协议
