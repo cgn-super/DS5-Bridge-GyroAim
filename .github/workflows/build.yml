@@ -1,0 +1,104 @@
+name: Build Gyro-Aim Firmware (RP2350)
+
+on:
+  push:
+    branches:
+      - main
+      - master
+    paths:
+      - 'src/**'
+      - '.github/workflows/**'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Compile Pico 2 W (.uf2)
+    runs-on: ubuntu-latest
+
+    env:
+      PICO_SDK_REF: "2.3.1"
+      ARM_TOOLCHAIN_URL: "https://gitlab.arm.com/api/v4/projects/tooling%2Fgnu-toolchains-for-arm/packages/generic/gnu-toolchain/15.2.rel1/arm-gnu-toolchain-15.2.rel1-x86_64-arm-none-eabi.tar.xz"
+      ARM_TOOLCHAIN_PATH: "${{ github.workspace }}/arm-toolchain"
+      PICO_SDK_PATH: "${{ github.workspace }}/pico-sdk"
+
+    steps:
+      - name: Checkout DS5-Bridge-GyroAim Source
+        uses: actions/checkout@v4
+        with:
+          path: gyro-aim-repo
+
+      - name: Install System Build Tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake ninja-build python3 build-essential xz-utils curl git
+
+      - name: Cache ARM Toolchain
+        id: cache-toolchain
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.ARM_TOOLCHAIN_PATH }}
+          key: arm-toolchain-15.2.rel1-v1
+
+      - name: Download & Extract ARM GNU Toolchain
+        if: steps.cache-toolchain.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p "$ARM_TOOLCHAIN_PATH"
+          echo "Downloading ARM Toolchain from $ARM_TOOLCHAIN_URL..."
+          curl -sSL "$ARM_TOOLCHAIN_URL" -o arm-toolchain.tar.xz
+          tar -xf arm-toolchain.tar.xz -C "$ARM_TOOLCHAIN_PATH" --strip-components=1
+          rm arm-toolchain.tar.xz
+
+      - name: Add ARM Toolchain to PATH
+        run: |
+          echo "$ARM_TOOLCHAIN_PATH/bin" >> $GITHUB_PATH
+
+      - name: Verify Toolchain
+        run: |
+          arm-none-eabi-gcc --version
+          cmake --version
+          ninja --version
+
+      - name: Clone Raspberry Pi Pico SDK
+        run: |
+          git clone --depth 1 --branch "$PICO_SDK_REF" https://github.com/raspberrypi/pico-sdk.git "$PICO_SDK_PATH"
+          git -C "$PICO_SDK_PATH" submodule update --init --recursive
+
+      - name: Clone Upstream DS5Dongle (v0.7.2-hotfix)
+        run: |
+          git clone --depth 1 --branch v0.7.2-hotfix https://github.com/awalol/DS5Dongle.git ds5dongle
+          git -C ds5dongle submodule update --init --recursive
+
+      - name: Inject Custom Gyro-Aim Algorithm & Patch
+        run: |
+          # Copy custom gyro algorithm sources into DS5Dongle tree
+          cp gyro-aim-repo/src/gyro_aim.cpp ds5dongle/src/
+          cp gyro-aim-repo/src/gyro_aim.h ds5dongle/src/
+
+          # Apply hook into CMakeLists.txt and src/main.cpp
+          cd ds5dongle
+          git apply ../gyro-aim-repo/src/patch_against_official_v0.7.2.patch
+
+      - name: Compile RP2350 Firmware (Ninja Release)
+        shell: bash
+        run: |
+          cd ds5dongle
+          cmake -S . -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DPICO_SDK_PATH="$PICO_SDK_PATH"
+
+          cmake --build build --target ds5-bridge -j$(nproc)
+
+          # Prepare output folder
+          mkdir -p ../output
+          cp build/ds5-bridge.uf2 ../output/ds5-bridge-v0.7.2-gyroL2-flydigi-grade.uf2
+          cp build/ds5-bridge.uf2 ../output/ds5-bridge-v0.7.2-gyroL2.uf2
+
+      - name: Upload UF2 Firmware as Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: DS5-Bridge-GyroAim-v0.7.2-RP2350
+          path: output/*.uf2
+          if-no-files-found: error
