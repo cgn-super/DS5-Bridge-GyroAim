@@ -52,29 +52,35 @@
 
 ---
 
-### 4. 双物理量纲档案与 6 轴四元数 + PD 超前控制律
+### 4. 移植自 `Motion Studio (JSM/FlexInput)` + `GamepadMotion` + `XY-CtoPS5` 的工业级体感管线
 
-#### 预设双档案参数（定义于 `src/gyro_aim.h`）：
+彻底摒弃破坏手眼肌肉记忆的“四元数全轴旋转、PD 微分放大、漏积分拖尾、扣扳机砍增益、过零回弹砍增益”，100% 遵循业界成熟开源方案（`hotuns/MotionStudio`、`JibbSmart/GamepadMotionHelpers`、`SWTiCC/XY-CtoPS5`）：
 
-| 参数字段 | `kCombatProfile`（枪械精确瞄准档） | `kGrenadeProfile`（手雷/下挂榴弹广域档） | 物理意义 |
+#### (1) 全局唯一的游戏引擎右摇杆逆向标定层（`OutStickCalibration kGameStickCal`）
+| 参数字段 | 默认标定值 | 物理意义（对应 `Motion Studio` `pad::OutStick`） |
+| :--- | :---: | :--- |
+| `calibration_dps` | `240.0f °/s` | `VIRTUAL_STICK_CALIBRATION`：右摇杆推满 100% 对应的游戏内视角最大转速 |
+| `undeadzone_inner` | `0.13f` | `RIGHT_UNDEADZONE_INNER`：游戏右摇杆 13% 内死区逆抬升 |
+| `undeadzone_outer` | `0.03f` | `RIGHT_UNDEADZONE_OUTER`：游戏右摇杆外圈饱和余量 |
+| `unpower` | `1.30f` | `RIGHT_UNPOWER`：通过 `powf(strength, 1.0f / unpower)` 抵消游戏右摇杆的幂次加速曲线 |
+| `max_stick_out` | `0.92f` | 避开部分主机游戏 `>92%` 外圈转身突变加速陷阱 |
+
+#### (2) 基础射击层 + 投掷动作覆盖层（`Motion Studio` `Base + Layer Modeshift` 架构）
+| 参数字段 | `kCombatProfile`（普通射击基础层） | `kGrenadeProfile`（手雷/下挂榴弹覆盖层） | 物理意义 |
 | :--- | :---: | :---: | :--- |
-| `full_scale_dps` | `160.0f °/s` | `95.0f °/s` | 满量程角速度基准 |
-| `yx_ratio` | `0.60f` | `0.95f` | 垂直(Pitch)相对水平(Yaw)灵敏度比 |
-| `gamma` | `0.70f` | `0.75f` | 逆响应曲线幂次压缩指数 |
-| `kp_gain` | `1.00f` | `1.00f` | 比例主增益 |
-| `kd_lead_sec` | `0.018f s` | `0.012f s` | PD 微分超前时间常数（击穿镜头平滑惯性） |
-| `v_low` / `v_high` | `1.5f` / `15.0f °/s` | `0.4f` / `8.0f °/s` | 微速强低通二次钳制上限 / 零延迟直通下限 |
-| `anti_deadzone` | `0.12f` | `0.12f` | 85% 径向 + 15% 轴向混合反死区比例 |
-| `leaky_tau_sec` | `0.045f s` | `0.035f s` | 短时角度误差漏积分器衰减时间常数 |
-| `max_stick_out` | `0.84f` | `0.92f` | 最大摇杆占空上限（避开游戏 85%+ 外圈加速陷阱） |
+| `min_sens` / `max_sens` | `1.00x` -> `1.65x` | `1.55x` -> `2.25x` | 微调区 **1:1 纯线性灵敏度** / 高速甩动上限倍率 |
+| `min_threshold_dps` / `max_threshold_dps` | `15.0` / `75.0 °/s` | `10.0` / `65.0 °/s` | 双段线性加速起点 / 满额转速 |
+| `yx_ratio` | **`0.60f`**（水平扫射防上下晃） | **`1.00f`**（1:1 垂直等比大仰角抛物线） | 垂直(Pitch)相对水平(Yaw)灵敏度比例 |
+| `cutoff_speed_dps` / `cutoff_recovery_dps` | `0.55` / `1.80 °/s` | `0.40` / `1.40 °/s` | JSM 静止底噪截止速度 / 线性淡入恢复转速 |
+| `smooth_time_sec` / `smooth_threshold_dps` | `12 ms` / `45.0 °/s` | `10 ms` / `40.0 °/s` | `Decay::smooth` 零残留衰减平滑窗口（急停零拖尾） |
+| `one_euro_min_cutoff` / `one_euro_beta` | `5.5 Hz` / `0.30` | `6.5 Hz` / `0.35` | `One-Euro Filter` 一欧元速度自适应滤波器 |
+| `roll_mix` | `0.15f` | `0.20f` | `XY-CtoPS5` / JSM 方向盘横滚辅助转向混入比例 |
 
-#### 控制律核心管线（实现于 `src/gyro_aim.cpp`）：
-1. **3MHz 硬件时钟 $\Delta t$ 与 `0x05` 出厂校准**：解析 `SensorTimestamp` 精确计算每帧 $\Delta t \in [0.0005\text{s}, 0.02\text{s}]$；零拷贝读取 `Feature Report 0x05` 出厂标定参数，配合 `0.6s` 滑动静止窗口持续收敛温漂 Bias。
-2. **最短弧四元数正交玩家空间（$q_{\text{align}}$）**：仅在 $\|\mathbf{a}\| \in [0.85g, 1.15g]$ 时按可信度加权互补滤波跟踪重力向量 $\hat{\mathbf{g}}$，求解旋转至竖直轴 $(0, 1, 0)$ 的最短弧四元数 $q_{\text{align}}$，消除任意握持俯仰角下的 Yaw/Roll 串扰。
-3. **壳体振动抑制 + 急停回弹阻尼 + R2 扣扳机微抑制**：
-   - 实时监测高频角加速度能量，在马达强烈震动时自动收紧 `v_low`；
-   - `40ms` 内出现 `> 45 °/s` 高速甩枪且随后过零反向时，启动 `35ms` `0.30f` 急停回弹阻尼，吞掉肌腱回弹；
-   - `R2` 跨过 `45` 上升沿启动 `30ms` `0.25f` 恢复包络，消除第一枪扣扳机震偏。
+#### (3) 核心算法五大支柱（实现于 `src/gyro_aim.cpp`）：
+1. **`GamepadMotion::SensorMinMaxWindow` 稳健静止校准**：采集 `0.5s` 窗口内三轴陀螺仪与加速度计的峰峰值（`Max - Min`），仅在真静止时向窗口均值 `MeanGyro` 收敛，绝不在匀速慢速跟枪时误吞瞄准输入。
+2. **`GamepadMotion::CalculatePlayerSpaceGyro` 正交玩家空间**：**Pitch（俯仰）100% 保持手柄本地 X 轴**（彻底杜绝重力加速度计与手柄震动污染垂直压枪）；**Yaw（水平转向）**投影至重力平面并乘以 `1.41f`（$45^\circ$ 握持倾角宽容度）以 `hypot(gyroY, gyroZ)` 封顶，平端或翘起 $45^\circ$ 握持均保持 100% 水平转向灵敏度。
+3. **`Motion Studio` `OneEuro` + `Decay::smooth` 零拖尾平滑**：高速甩枪时 `smoothed_share -> 0`，高速分量不充入低通滤波器电容而走 `immediate_share` 直出，手腕急停瞬间滤波器内部零残余电荷，准星急停即停。
+4. **`Motion Studio` `pad::virtual_stick` 角速度域合成（Rate-Domain Mixing）**：先将物理右摇杆推杆量按 `unpower` 正向还原为游戏内视角转速 $\boldsymbol{\omega}_{\text{stick}}$（$^\circ/\text{s}$），在**角速度域**与陀螺仪角速度 $\boldsymbol{\omega}_{\text{gyro}}$ 直接相加，最后统一做唯一一次反死区与逆幂次映射，彻底消除“推右摇杆+体感”时的双重反死区跳变。
 
 ---
 

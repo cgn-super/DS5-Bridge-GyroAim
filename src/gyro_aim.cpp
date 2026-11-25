@@ -1,8 +1,14 @@
 //
-// DS5-Bridge Gyro-Aim v2.0 — Ultimate 6-Axis IMU Attitude & PD Lead Control Architecture
+// DS5-Bridge Gyro-Aim v2.1 — Industry-Standard JSM / Motion Studio / GamepadMotion Pipeline
 // Target: Raspberry Pi Pico 2 W (RP2350 Cortex-M33 Single-Precision FPU @ 250 MHz)
 //
-// Zero dynamic memory allocation, zero compiler warnings, 100% SRAM time-critical hot path.
+// Pure Port of Industry-Proven Algorithms:
+//   - GamepadMotionHelpers::SensorMinMaxWindow (0.5s peak-to-peak stillness auto-calibration)
+//   - GamepadMotionHelpers::CalculatePlayerSpaceGyro (100% local Pitch + Gravity-projected Yaw with 1.41f relax)
+//   - Motion Studio / FlexInput OneEuro Filter + Decay::smooth (zero filter-memory overhang on fast stop)
+//   - Motion Studio / JSM cutoff_factor + Two-Segment Linear Sensitivity Ramp
+//   - Motion Studio / JSM pad::virtual_stick Rate-Domain Mixer (combines physical stick & gyro in deg/s)
+//   - Motion Studio Layer Modeshift (Base Combat Layer vs. Hold-Circle / Toggle-Underbarrel Grenade Layer)
 //
 
 #include "gyro_aim.h"
@@ -36,17 +42,16 @@ bool gyro_bypass_debug = false;
 
 namespace {
 
-enum class ActiveProfileState : uint8_t {
+enum class ActiveLayer : uint8_t {
     kNone    = 0,
     kCombat  = 1,
     kGrenade = 2
 };
 
-// Active mode (defaults to Mode 1: kCombatAndGrenade)
 static ActivationMode active_mode = ActivationMode::kCombatAndGrenade;
-static ActiveProfileState active_profile_state = ActiveProfileState::kNone;
+static ActiveLayer active_layer = ActiveLayer::kNone;
 
-// Factory Calibration (Feature Report 0x05, fallback: 1/16 deg/s/LSB, 1/8192 g/LSB)
+// 1. Factory Calibration (Feature Report 0x05, fallback: 1/16 deg/s/LSB, 1/8192 g/LSB)
 static bool factory_cal_loaded = false;
 static uint8_t factory_cal_probe_div = 0;
 static float cal_gyro_scale_x = 1.0f / 16.0f; // Pitch (°/s per LSB)
@@ -59,59 +64,186 @@ static float cal_accel_bias_x = 0.0f;
 static float cal_accel_bias_y = 0.0f;
 static float cal_accel_bias_z = 0.0f;
 
-// Online Thermal Drift Bias (in °/s) & 0.6s Sliding Stillness Window
+// 2. GamepadMotionHelpers::SensorMinMaxWindow (0.5s Peak-to-Peak Stillness AutoCalibration)
 static bool bias_seeded = false;
 static float bias_gx_dps = 0.0f;
 static float bias_gy_dps = 0.0f;
 static float bias_gz_dps = 0.0f;
-static float prev_ax_g = 0.0f;
-static float prev_ay_g = 1.0f;
-static float prev_az_g = 0.0f;
-static float still_accum_sec = 0.0f;
 
-// Hardware SensorTimestamp (3 MHz, 1/3 us per tick)
+struct SensorMinMaxWindow {
+    float min_gx, max_gx, mean_gx;
+    float min_gy, max_gy, mean_gy;
+    float min_gz, max_gz, mean_gz;
+    float min_ax, max_ax;
+    float min_ay, max_ay;
+    float min_az, max_az;
+    uint32_t num_samples;
+    float time_sampled;
+
+    void reset() {
+        num_samples = 0;
+        time_sampled = 0.0f;
+    }
+
+    void add_sample(float gx, float gy, float gz, float ax, float ay, float az, float dt) {
+        if (num_samples == 0) {
+            min_gx = max_gx = mean_gx = gx;
+            min_gy = max_gy = mean_gy = gy;
+            min_gz = max_gz = mean_gz = gz;
+            min_ax = max_ax = ax;
+            min_ay = max_ay = ay;
+            min_az = max_az = az;
+            num_samples = 1;
+            time_sampled = dt;
+            return;
+        }
+        if (gx < min_gx) min_gx = gx;
+        if (gx > max_gx) max_gx = gx;
+        if (gy < min_gy) min_gy = gy;
+        if (gy > max_gy) max_gy = gy;
+        if (gz < min_gz) min_gz = gz;
+        if (gz > max_gz) max_gz = gz;
+
+        if (ax < min_ax) min_ax = ax;
+        if (ax > max_ax) max_ax = ax;
+        if (ay < min_ay) min_ay = ay;
+        if (ay > max_ay) max_ay = ay;
+        if (az < min_az) min_az = az;
+        if (az > max_az) max_az = az;
+
+        ++num_samples;
+        time_sampled += dt;
+        const float inv_n = 1.0f / (float)num_samples;
+        mean_gx += (gx - mean_gx) * inv_n;
+        mean_gy += (gy - mean_gy) * inv_n;
+        mean_gz += (gz - mean_gz) * inv_n;
+    }
+};
+
+static SensorMinMaxWindow still_win{};
+
+// 3. Hardware SensorTimestamp (3 MHz, 1/3 us per tick)
 static bool ts_seeded = false;
 static uint32_t prev_sensor_ts = 0;
-static float dt_smooth_sec = 0.002f;
 
-// Gravity Unit Vector in Controller Body Frame (+Y is up when flat on desk)
+// 4. Gravity Direction Vector in Controller Body Frame (+Y is up when flat on desk)
 static float grav_x = 0.0f;
 static float grav_y = 1.0f;
 static float grav_z = 0.0f;
 
-// Control Law States (Reset on profile transition or shortcut trigger)
-static float filt_yaw_dps = 0.0f;
-static float filt_pitch_dps = 0.0f;
-static float prev_filt_yaw_dps = 0.0f;
-static float prev_filt_pitch_dps = 0.0f;
-static float deriv_yaw_dps2 = 0.0f;
-static float deriv_pitch_dps2 = 0.0f;
-static float leaky_yaw_dps = 0.0f;
-static float leaky_pitch_dps = 0.0f;
-static float cached_out_norm_x = 0.0f;
-static float cached_out_norm_y = 0.0f;
+// 5. Motion Studio / FlexInput cc::OneEuro & cc::Decay Smoothers (cc.rs:171-261)
+struct LowPass1P {
+    float prev = 0.0f;
+    bool started = false;
 
-// Chassis Vibration Energy Monitor
-static float prev_raw_yaw_dps = 0.0f;
-static float prev_raw_pitch_dps = 0.0f;
-static float vib_energy_ema = 0.0f;
+    void reset() {
+        prev = 0.0f;
+        started = false;
+    }
 
-// Fast-Stop Rebound Damping State (40ms flick memory -> 35ms 0.30f damping)
-static float fast_flick_timer_ms = 0.0f;
-static int8_t fast_flick_sign_x = 0;
-static int8_t fast_flick_sign_y = 0;
-static float rebound_damp_ms = 0.0f;
+    float filter(float x, float a) {
+        if (!started) {
+            prev = x;
+            started = true;
+            return x;
+        }
+        prev = a * x + (1.0f - a) * prev;
+        return prev;
+    }
+};
 
-// R2 Trigger Pull Instant Suppression (R2 rising across 45 -> 30ms @ 0.25f envelope)
-static uint8_t prev_r2_val = 0;
-static float r2_suppress_ms = 0.0f;
+struct OneEuroFilter {
+    LowPass1P val{};
+    LowPass1P deriv{};
+    float prev_x = 0.0f;
+    bool started = false;
+
+    void reset() {
+        val.reset();
+        deriv.reset();
+        prev_x = 0.0f;
+        started = false;
+    }
+
+    static inline float alpha_from_cutoff(float cutoff_hz, float dt) {
+        constexpr float kTau = 6.283185307f;
+        const float c = cutoff_hz > 1e-4f ? cutoff_hz : 1e-4f;
+        const float safe_dt = dt > 1e-5f ? dt : 1e-5f;
+        const float tau = 1.0f / (kTau * c);
+        return 1.0f / (1.0f + tau / safe_dt);
+    }
+
+    float filter(float x, float dt, float min_cutoff_hz, float beta) {
+        const float safe_dt = dt > 1e-5f ? dt : 1e-5f;
+        const float dx = started ? ((x - prev_x) / safe_dt) : 0.0f;
+        prev_x = x;
+        started = true;
+        // D_CUTOFF = 1.0 Hz in Motion Studio cc.rs:198
+        const float edx = deriv.filter(dx, alpha_from_cutoff(1.0f, safe_dt));
+        const float cutoff = min_cutoff_hz + beta * fabsf(edx);
+        return val.filter(x, alpha_from_cutoff(cutoff, safe_dt));
+    }
+};
+
+// Motion Studio cc::Decay (cc.rs:224-261):
+// Shrinks both the smoothed share AND the effective time constant to zero as speed approaches threshold.
+// Guarantees ZERO filter-memory overhang when stopping a fast flick!
+struct DecaySmoother {
+    float sx = 0.0f;
+    float sy = 0.0f;
+    bool started = false;
+
+    void reset() {
+        sx = 0.0f;
+        sy = 0.0f;
+        started = false;
+    }
+
+    void smooth(float in_x, float in_y, float dt, float smooth_time_s, float threshold_dps,
+                float &out_x, float &out_y) {
+        if (smooth_time_s <= 0.0f || threshold_dps <= 0.0f) {
+            started = false;
+            out_x = in_x;
+            out_y = in_y;
+            return;
+        }
+        const float speed = sqrtf(in_x * in_x + in_y * in_y);
+        float fast = speed / threshold_dps;
+        if (fast > 1.0f) fast = 1.0f;
+        const float one_minus_fast = 1.0f - fast;
+        const float smoothed_share = one_minus_fast * one_minus_fast;
+        const float immediate_share = 1.0f - smoothed_share;
+
+        const float target_x = in_x * smoothed_share;
+        const float target_y = in_y * smoothed_share;
+        if (!started) {
+            sx = target_x;
+            sy = target_y;
+            started = true;
+        }
+        const float effective_tau = smooth_time_s * smoothed_share;
+        const float a = (effective_tau <= 1e-5f) ? 1.0f : (1.0f - expf(-dt / effective_tau));
+        sx += a * (target_x - sx);
+        sy += a * (target_y - sy);
+
+        out_x = sx + in_x * immediate_share;
+        out_y = sy + in_y * immediate_share;
+    }
+};
+
+static OneEuroFilter one_euro_x{};
+static OneEuroFilter one_euro_y{};
+static DecaySmoother decay_smoother{};
+
+// Retained desired camera turn rate in deg/s (held across duplicate 500Hz USB polls between BT packets)
+static float retained_gyro_x_dps = 0.0f;
+static float retained_gyro_y_dps = 0.0f;
 
 // Ergonomic State Machine Timers & Latches
 static bool combat_trig_engaged = false;
 static bool underbarrel_gl_active = false;
 static bool prev_touch_right_active = false;
 static float r3_pulse_hold_ms = 0.0f;
-static float touch_landing_mute_ms = 0.0f;
 static float shortcut_mute_ms = 0.0f;
 static float circle_hold_ms = 0.0f;
 static float grenade_tail_ms = 0.0f;
@@ -146,6 +278,10 @@ static inline float maxf(float a, float b) {
     return a > b ? a : b;
 }
 
+static inline float minf(float a, float b) {
+    return a < b ? a : b;
+}
+
 static inline float smoothstepf(float edge0, float edge1, float x) {
     const float denom = edge1 - edge0;
     if (denom <= 1e-6f) return x >= edge1 ? 1.0f : 0.0f;
@@ -157,19 +293,12 @@ static inline int16_t read_le_i16(const uint8_t *p) {
     return (int16_t)((uint16_t)p[0] | ((uint16_t)p[1] << 8));
 }
 
-static inline void reset_control_history() {
-    filt_yaw_dps = 0.0f;
-    filt_pitch_dps = 0.0f;
-    prev_filt_yaw_dps = 0.0f;
-    prev_filt_pitch_dps = 0.0f;
-    deriv_yaw_dps2 = 0.0f;
-    deriv_pitch_dps2 = 0.0f;
-    leaky_yaw_dps = 0.0f;
-    leaky_pitch_dps = 0.0f;
-    cached_out_norm_x = 0.0f;
-    cached_out_norm_y = 0.0f;
-    fast_flick_timer_ms = 0.0f;
-    rebound_damp_ms = 0.0f;
+static inline void reset_filter_state() {
+    one_euro_x.reset();
+    one_euro_y.reset();
+    decay_smoother.reset();
+    retained_gyro_x_dps = 0.0f;
+    retained_gyro_y_dps = 0.0f;
 }
 
 // ---------------------------------------------------------------------------
@@ -213,11 +342,11 @@ static void get_active_target_led(uint8_t &r, uint8_t &g, uint8_t &b) {
         r = flash_led_r; g = flash_led_g; b = flash_led_b;
         return;
     }
-    if (active_profile_state == ActiveProfileState::kGrenade) {
-        r = 255; g = 110; b = 0; // Tactical Orange for Grenade / Underbarrel GL
+    if (active_layer == ActiveLayer::kGrenade) {
+        r = 255; g = 110; b = 0; // Tactical Orange for Grenade / Underbarrel GL Layer
         return;
     }
-    if (active_profile_state == ActiveProfileState::kCombat &&
+    if (active_layer == ActiveLayer::kCombat &&
         active_mode == ActivationMode::kClassicTwoStage) {
         r = 255; g = 20; b = 40; // Classic Crimson Red on Two-Stage wall break
         return;
@@ -233,14 +362,14 @@ static void get_active_target_led(uint8_t &r, uint8_t &g, uint8_t &b) {
 
 static void try_load_factory_calibration() {
     if (factory_cal_loaded) return;
-    if (++factory_cal_probe_div != 1) return; // Probe once every 256 reports until loaded
+    if (++factory_cal_probe_div != 1) return;
 
     const auto it = feature_data.find(0x05);
     if (it == feature_data.end() || it->second.size() < 34) {
         return;
     }
 
-    const uint8_t *buf = it->second.data(); // Starts at byte 1 of Feature Report 0x05
+    const uint8_t *buf = it->second.data();
     const int16_t pitch_plus  = read_le_i16(buf + 6);
     const int16_t pitch_minus = read_le_i16(buf + 8);
     const int16_t yaw_plus    = read_le_i16(buf + 10);
@@ -305,9 +434,9 @@ void __not_in_flash_func(host_boost_hook_apply)(USBGetStateData &r) {
         if (!boost_combo_latch) {
             boost_combo_latch = true;
             boost_hook_seq = (uint8_t)(((boost_hook_seq + 1) & 0x0F) | 0x01);
-            boost_hook_frames = 300; // ~0.6s pulse at 500Hz
+            boost_hook_frames = 300;
             boost_led_active = true;
-            send_gyro_led_and_wall(0, 240, 255); // Ice Cyan visual confirmation
+            send_gyro_led_and_wall(0, 240, 255);
         }
     } else {
         boost_combo_latch = false;
@@ -351,7 +480,7 @@ void __not_in_flash_func(gyro_aim_apply)(USBGetStateData &r) {
     // ---- 1. Boot Link Initialization & MSI Auto-Boost Hook ----
     if (!wall_armed_on_boot && r.SensorTimestamp > 0) {
         wall_armed_on_boot = true;
-        boost_hook_frames = 500; // ~1.0s initial auto-boost signal pulse on controller link
+        boost_hook_frames = 500;
         send_gyro_led_and_wall(saved_led_r, saved_led_g, saved_led_b);
     }
 
@@ -370,18 +499,12 @@ void __not_in_flash_func(gyro_aim_apply)(USBGetStateData &r) {
         const uint32_t delta_ticks = r.SensorTimestamp - prev_sensor_ts;
         prev_sensor_ts = r.SensorTimestamp;
         const float raw_dt = (float)delta_ticks * (1.0f / 3000000.0f);
-        const float clamped_dt = clampf(raw_dt, 0.0005f, 0.02f);
-        // Smooth sudden timestamp jumps while tracking true crystal interval
-        dt_smooth_sec = (raw_dt >= 0.0005f && raw_dt <= 0.02f)
-                            ? (0.85f * dt_smooth_sec + 0.15f * clamped_dt)
-                            : dt_smooth_sec;
-        dt_sec = clamped_dt;
+        dt_sec = clampf(raw_dt, 0.0005f, 0.02f);
         is_new_imu_sample = true;
     }
 
     const float frame_dt_ms = (float)DS5_USB_POLL_INTERVAL_MS;
 
-    // ---- 3. Update Visual Flash & Suppression Countdown Timers ----
     if (mode_led_flash_ms > 0.0f) {
         mode_led_flash_ms -= frame_dt_ms;
         if (mode_led_flash_ms <= 0.0f) {
@@ -394,23 +517,11 @@ void __not_in_flash_func(gyro_aim_apply)(USBGetStateData &r) {
     if (shortcut_mute_ms > 0.0f) {
         shortcut_mute_ms = maxf(0.0f, shortcut_mute_ms - frame_dt_ms);
     }
-    if (touch_landing_mute_ms > 0.0f) {
-        touch_landing_mute_ms = maxf(0.0f, touch_landing_mute_ms - frame_dt_ms);
-    }
     if (r3_pulse_hold_ms > 0.0f) {
         r3_pulse_hold_ms = maxf(0.0f, r3_pulse_hold_ms - frame_dt_ms);
     }
-    if (fast_flick_timer_ms > 0.0f) {
-        fast_flick_timer_ms = maxf(0.0f, fast_flick_timer_ms - frame_dt_ms);
-    }
-    if (rebound_damp_ms > 0.0f) {
-        rebound_damp_ms = maxf(0.0f, rebound_damp_ms - frame_dt_ms);
-    }
-    if (r2_suppress_ms > 0.0f) {
-        r2_suppress_ms = maxf(0.0f, r2_suppress_ms - frame_dt_ms);
-    }
 
-    // ---- 4. On-the-Fly Shortcut Combos: Create(Share) + D-Pad ----
+    // ---- 3. On-the-Fly Shortcut Combos: Create(Share) + D-Pad ----
     if (r.ButtonCreate) {
         const uint8_t dpad_now = (uint8_t)r.DPad;
         if (dpad_now != (uint8_t)Direction::None && prev_shortcut_dpad == (uint8_t)Direction::None) {
@@ -425,16 +536,16 @@ void __not_in_flash_func(gyro_aim_apply)(USBGetStateData &r) {
                 mode_led_flash_ms = 300.0f;
                 switch (active_mode) {
                     case ActivationMode::kCombatAndGrenade:
-                        flash_led_r = 0; flash_led_g = 230; flash_led_b = 100; // Mode 1: Emerald Green
+                        flash_led_r = 0; flash_led_g = 230; flash_led_b = 100;
                         break;
                     case ActivationMode::kSoftL2Only:
-                        flash_led_r = 0; flash_led_g = 120; flash_led_b = 255; // Mode 2: Sapphire Blue
+                        flash_led_r = 0; flash_led_g = 120; flash_led_b = 255;
                         break;
                     case ActivationMode::kAlwaysOnSmartStick:
-                        flash_led_r = 255; flash_led_g = 175; flash_led_b = 0; // Mode 3: Amber Yellow
+                        flash_led_r = 255; flash_led_g = 175; flash_led_b = 0;
                         break;
                     case ActivationMode::kClassicTwoStage:
-                        flash_led_r = 255; flash_led_g = 20; flash_led_b = 40; // Mode 4: Crimson Red
+                        flash_led_r = 255; flash_led_g = 20; flash_led_b = 40;
                         break;
                 }
                 send_gyro_led_and_wall(flash_led_r, flash_led_g, flash_led_b);
@@ -443,13 +554,12 @@ void __not_in_flash_func(gyro_aim_apply)(USBGetStateData &r) {
                 user_sens_scale = clampf(user_sens_scale + step, 0.50f, 2.00f);
                 triggered = true;
                 mode_led_flash_ms = 220.0f;
-                flash_led_r = 255; flash_led_g = 255; flash_led_b = 255; // White Flash
+                flash_led_r = 255; flash_led_g = 255; flash_led_b = 255;
                 send_gyro_led_and_wall(flash_led_r, flash_led_g, flash_led_b);
             }
-
             if (triggered) {
                 shortcut_mute_ms = 80.0f;
-                reset_control_history();
+                reset_filter_state();
             }
         }
         prev_shortcut_dpad = dpad_now;
@@ -461,16 +571,14 @@ void __not_in_flash_func(gyro_aim_apply)(USBGetStateData &r) {
         prev_shortcut_dpad = (uint8_t)Direction::None;
     }
 
-    // ---- 5. Right-Half Capacitive Touchpad -> R3 & Contextual Underbarrel GL ----
-    // Touchpad resolution is 1920x1080 (X: 0..1919). Finger[0].NotTouching == 0 means active contact.
+    // ---- 4. Right-Half Capacitive Touchpad -> R3 & Contextual Underbarrel GL Layer ----
     const bool touch0_active = (r.Touch.Finger[0].NotTouching == 0);
     const uint16_t touch0_x = (uint16_t)r.Touch.Finger[0].FingerX;
     const bool touch_right_active = touch0_active && (touch0_x >= 960);
 
     if (touch_right_active && !prev_touch_right_active) {
-        // Rising edge of right-half touchpad tap
-        r3_pulse_hold_ms = 50.0f;       // Minimum 50ms R3 pulse guarantee
-        touch_landing_mute_ms = 60.0f;  // 60ms gyro mute to absorb thumb landing tremor
+        r3_pulse_hold_ms = 50.0f;
+        // Motion Studio LayerMode::Toggle with exit_input = L2 release
         if (r.TriggerLeft >= GA_SOFT_TRIG_ON) {
             underbarrel_gl_active = !underbarrel_gl_active;
         }
@@ -478,14 +586,14 @@ void __not_in_flash_func(gyro_aim_apply)(USBGetStateData &r) {
     prev_touch_right_active = touch_right_active;
 
     if (r.TriggerLeft < GA_SOFT_TRIG_OFF) {
-        underbarrel_gl_active = false; // Auto-reset underbarrel GL state when releasing L2 ADS
+        underbarrel_gl_active = false;
     }
 
     if (touch_right_active || r3_pulse_hold_ms > 0.0f) {
-        r.ButtonR3 = 1; // Logical OR with physical R3; physical ButtonPad remains 100% untouched
+        r.ButtonR3 = 1;
     }
 
-    // ---- 6. Circle (O) Hold Grenade Throw & Priority Arbitration ----
+    // ---- 5. Motion Studio Layer Arbitration (Base Combat vs. Grenade Layer) ----
     if (r.ButtonCircle) {
         circle_hold_ms += frame_dt_ms;
         if (circle_hold_ms >= 80.0f) {
@@ -497,9 +605,10 @@ void __not_in_flash_func(gyro_aim_apply)(USBGetStateData &r) {
             grenade_tail_ms = maxf(0.0f, grenade_tail_ms - frame_dt_ms);
         }
     }
-    const bool grenade_throw_active = (circle_hold_ms >= 80.0f) || (grenade_tail_ms > 0.0f);
+    const bool grenade_layer_on = (circle_hold_ms >= 80.0f) ||
+                                  (grenade_tail_ms > 0.0f) ||
+                                  (underbarrel_gl_active && r.TriggerLeft >= GA_SOFT_TRIG_OFF);
 
-    // Evaluate mode-dependent combat trigger engagement with hysteresis
     switch (active_mode) {
         case ActivationMode::kCombatAndGrenade:
             if (!combat_trig_engaged && (r.TriggerLeft >= GA_SOFT_TRIG_ON || r.TriggerRight >= GA_SOFT_TRIG_ON)) {
@@ -527,17 +636,19 @@ void __not_in_flash_func(gyro_aim_apply)(USBGetStateData &r) {
             break;
     }
 
-    // Priority Arbitration: Grenade Throw > Underbarrel GL (while ADS) > Combat Trigger > None
-    ActiveProfileState next_profile_state = ActiveProfileState::kNone;
-    if (grenade_throw_active || (underbarrel_gl_active && r.TriggerLeft >= GA_SOFT_TRIG_OFF)) {
-        next_profile_state = ActiveProfileState::kGrenade;
+    ActiveLayer next_layer = ActiveLayer::kNone;
+    if (grenade_layer_on) {
+        next_layer = ActiveLayer::kGrenade;
     } else if (combat_trig_engaged) {
-        next_profile_state = ActiveProfileState::kCombat;
+        next_layer = ActiveLayer::kCombat;
     }
 
-    if (next_profile_state != active_profile_state) {
-        active_profile_state = next_profile_state;
-        reset_control_history();
+    if (next_layer != active_layer) {
+        if (next_layer == ActiveLayer::kNone) {
+            // Exact JSM aim.rs:691 block_sampled_gyro behavior: reset filter when gyro turns off
+            reset_filter_state();
+        }
+        active_layer = next_layer;
         if (mode_led_flash_ms <= 0.0f && !boost_led_active) {
             uint8_t lr, lg, lb;
             get_active_target_led(lr, lg, lb);
@@ -545,17 +656,8 @@ void __not_in_flash_func(gyro_aim_apply)(USBGetStateData &r) {
         }
     }
 
-    // Detect R2 trigger pull rising edge across 45 for 30ms first-shot recoil suppression
-    if (prev_r2_val < 45 && r.TriggerRight >= 45) {
-        r2_suppress_ms = 30.0f;
-    }
-    prev_r2_val = r.TriggerRight;
-
-    // ---- 7. 6-Axis IMU Scaling, Online Bias Tracking & Gravity Quaternion Alignment ----
-    // Map utils.h struct fields to DualSense's physical right-hand coordinate system (X=Right, Y=Up, Z=Back):
-    //   Offset 15 (AngularVelocityX) -> Pitch rate around +X
-    //   Offset 17 (AngularVelocityZ) -> Yaw rate around +Y (Vertical axis!)
-    //   Offset 19 (AngularVelocityY) -> Roll rate around +Z (Longitudinal axis!)
+    // ---- 6. GamepadMotionHelpers IMU Processing & Player Space Projection ----
+    // DualSense Y-up right-hand coordinate system (X = Pitch right, Y = Yaw up, Z = Roll back):
     const float raw_gx_dps = (float)r.AngularVelocityX * cal_gyro_scale_x;
     const float raw_gy_dps = (float)r.AngularVelocityZ * cal_gyro_scale_y;
     const float raw_gz_dps = (float)r.AngularVelocityY * cal_gyro_scale_z;
@@ -568,59 +670,53 @@ void __not_in_flash_func(gyro_aim_apply)(USBGetStateData &r) {
         bias_gx_dps = raw_gx_dps;
         bias_gy_dps = raw_gy_dps;
         bias_gz_dps = raw_gz_dps;
-        prev_ax_g = ax_g;
-        prev_ay_g = ay_g;
-        prev_az_g = az_g;
+        still_win.reset();
         bias_seeded = true;
     }
 
     if (is_new_imu_sample) {
+        // 6.1 GamepadMotionHelpers::SensorMinMaxWindow Stillness Auto-Calibration (GamepadMotion.hpp:670)
+        still_win.add_sample(raw_gx_dps, raw_gy_dps, raw_gz_dps, ax_g, ay_g, az_g, dt_sec);
+        const float span_gx = still_win.max_gx - still_win.min_gx;
+        const float span_gy = still_win.max_gy - still_win.min_gy;
+        const float span_gz = still_win.max_gz - still_win.min_gz;
+        const float span_ax = still_win.max_ax - still_win.min_ax;
+        const float span_ay = still_win.max_ay - still_win.min_ay;
+        const float span_az = still_win.max_az - still_win.min_az;
+
+        if (span_gx > 2.2f || span_gy > 2.2f || span_gz > 2.2f ||
+            span_ax > 0.06f || span_ay > 0.06f || span_az > 0.06f) {
+            still_win.reset();
+        } else if (still_win.time_sampled >= 0.50f && still_win.num_samples >= 20) {
+            // Smoothly blend bias toward window mean and start next window
+            bias_gx_dps = 0.70f * bias_gx_dps + 0.30f * still_win.mean_gx;
+            bias_gy_dps = 0.70f * bias_gy_dps + 0.30f * still_win.mean_gy;
+            bias_gz_dps = 0.70f * bias_gz_dps + 0.30f * still_win.mean_gz;
+            still_win.reset();
+        }
+
         const float wx_dps = raw_gx_dps - bias_gx_dps;
         const float wy_dps = raw_gy_dps - bias_gy_dps;
         const float wz_dps = raw_gz_dps - bias_gz_dps;
 
-        // 0.6s Sliding Window Stillness Detector for Continuous Thermal Drift Convergence
-        const float da_g = fabsf(ax_g - prev_ax_g) + fabsf(ay_g - prev_ay_g) + fabsf(az_g - prev_az_g);
-        prev_ax_g = ax_g;
-        prev_ay_g = ay_g;
-        prev_az_g = az_g;
-
-        const bool micro_still = (fabsf(wx_dps) < 1.8f && fabsf(wy_dps) < 1.8f && fabsf(wz_dps) < 1.8f && da_g < 0.045f);
-        if (micro_still) {
-            still_accum_sec += dt_sec;
-            if (still_accum_sec >= 0.60f) {
-                const float alpha_bias = clampf(dt_sec / 1.4f, 0.0005f, 0.015f);
-                bias_gx_dps += alpha_bias * wx_dps;
-                bias_gy_dps += alpha_bias * wy_dps;
-                bias_gz_dps += alpha_bias * wz_dps;
-            }
-        } else {
-            still_accum_sec = 0.0f;
-        }
-
-        // Complementary Filter for Unit Gravity Vector g_hat in Body Frame
+        // 6.2 Gravity Direction Tracking (GamepadMotion.hpp:599 & motion.rs:135)
         constexpr float kDegToRad = 0.01745329252f;
         const float wx_rad = wx_dps * kDegToRad;
         const float wy_rad = wy_dps * kDegToRad;
         const float wz_rad = wz_dps * kDegToRad;
 
-        // Gyro kinematics: dg/dt = g x w
         float gx_pred = grav_x + (grav_y * wz_rad - grav_z * wy_rad) * dt_sec;
         float gy_pred = grav_y + (grav_z * wx_rad - grav_x * wz_rad) * dt_sec;
         float gz_pred = grav_z + (grav_x * wy_rad - grav_y * wx_rad) * dt_sec;
 
         const float a_norm = sqrtf(ax_g * ax_g + ay_g * ay_g + az_g * az_g);
-        // Confidence-weighted accelerometer fusion: only trust accel when ||a|| in [0.85g, 1.15g]
-        if (a_norm >= 0.85f && a_norm <= 1.15f) {
+        if (a_norm >= 0.82f && a_norm <= 1.18f) {
             const float inv_a = 1.0f / a_norm;
-            const float ax_u = ax_g * inv_a;
-            const float ay_u = ay_g * inv_a;
-            const float az_u = az_g * inv_a;
-            const float conf = 1.0f - (fabsf(a_norm - 1.0f) * (1.0f / 0.15f));
-            const float beta = conf * clampf(dt_sec * 8.0f, 0.002f, 0.12f);
-            gx_pred = (1.0f - beta) * gx_pred + beta * ax_u;
-            gy_pred = (1.0f - beta) * gy_pred + beta * ay_u;
-            gz_pred = (1.0f - beta) * gz_pred + beta * az_u;
+            // GRAVITY_TAU = 0.5s from Motion Studio motion.rs:55
+            const float alpha_g = 1.0f - expf(-dt_sec * 2.0f);
+            gx_pred += alpha_g * (ax_g * inv_a - gx_pred);
+            gy_pred += alpha_g * (ay_g * inv_a - gy_pred);
+            gz_pred += alpha_g * (az_g * inv_a - gz_pred);
         }
 
         const float g_norm = sqrtf(gx_pred * gx_pred + gy_pred * gy_pred + gz_pred * gz_pred);
@@ -631,194 +727,130 @@ void __not_in_flash_func(gyro_aim_apply)(USBGetStateData &r) {
             grav_z = gz_pred * inv_g;
         }
 
-        // Shortest-Arc Quaternion q_align rotating g_hat -> Reference Vertical Axis u = (0, 1, 0)
-        // Cross product: g_hat x (0, 1, 0) = (-grav_z, 0, grav_x), Dot product: grav_y
-        float qw = 1.0f, qx = 0.0f, qy = 0.0f, qz = 0.0f;
-        if (grav_y > -0.999f) {
-            const float s = sqrtf(2.0f * (1.0f + grav_y));
-            const float inv_s = 1.0f / s;
-            qw = 0.5f * s;
-            qx = -grav_z * inv_s;
-            qy = 0.0f;
-            qz = grav_x * inv_s;
+        // 6.3 GamepadMotion::CalculatePlayerSpaceGyro (GamepadMotion.hpp:1169-1176) + XY-CtoPS5 Roll Mix
+        if (gyro_bypass_debug || active_layer == ActiveLayer::kNone || shortcut_mute_ms > 0.0f) {
+            reset_filter_state();
         } else {
-            qw = 0.0f; qx = 0.0f; qy = 0.0f; qz = 1.0f;
-        }
-
-        // Rotate body angular velocity (wx_dps, wy_dps, wz_dps) by q_align into Orthogonal Player Space:
-        // v' = v + 2*qw*(q_v x v) + 2*q_v x (q_v x v)
-        const float tx = 2.0f * (qy * wz_dps - qz * wy_dps);
-        const float ty = 2.0f * (qz * wx_dps - qx * wz_dps);
-        const float tz = 2.0f * (qx * wy_dps - qy * wx_dps);
-
-        const float wx_player = wx_dps + qw * tx + (qy * tz - qz * ty);
-        const float wy_player = wy_dps + qw * ty + (qz * tx - qx * tz);
-
-        // DualSense Right-Hand Polarity to Right Stick (Right = +X, Down = +Y):
-        // Turning right -> wy_player < 0 -> +StickX = -wy_player
-        // Tilting up    -> wx_player > 0 -> -StickY = -wx_player
-        const float raw_yaw_dps   = -wy_player;
-        const float raw_pitch_dps = -wx_player;
-
-        // ---- 8. Control Law Pipeline (Active on Fresh IMU Sample) ----
-        if (gyro_bypass_debug ||
-            active_profile_state == ActiveProfileState::kNone ||
-            shortcut_mute_ms > 0.0f ||
-            touch_landing_mute_ms > 0.0f) {
-            cached_out_norm_x = 0.0f;
-            cached_out_norm_y = 0.0f;
-            prev_raw_yaw_dps = raw_yaw_dps;
-            prev_raw_pitch_dps = raw_pitch_dps;
-        } else {
-            const GyroProfile &prof = (active_profile_state == ActiveProfileState::kGrenade)
+            const GyroProfile &prof = (active_layer == ActiveLayer::kGrenade)
                                           ? kGrenadeProfile
                                           : kCombatProfile;
 
-            // 8.1 Chassis Vibration Interference Monitor
-            const float hf_jerk = fabsf(raw_yaw_dps - prev_raw_yaw_dps) + fabsf(raw_pitch_dps - prev_raw_pitch_dps);
-            prev_raw_yaw_dps = raw_yaw_dps;
-            prev_raw_pitch_dps = raw_pitch_dps;
-            vib_energy_ema = 0.88f * vib_energy_ema + 0.12f * hf_jerk;
+            // Pitch is kept 100% on the controller's local X axis (zero gravity cross-axis bleed!)
+            const float local_pitch_dps = -wx_dps;
 
-            const float vib_boost = (vib_energy_ema > 10.0f)
-                                        ? clampf(1.0f + 0.05f * (vib_energy_ema - 10.0f), 1.0f, 2.0f)
-                                        : 1.0f;
-            const float eff_v_low = prof.v_low * vib_boost;
+            // Yaw uses Jibb Smart's Player Space gravity projection with yawRelaxFactor = 1.41f
+            // plus optional XY-CtoPS5 steering-wheel roll mix:
+            const float world_yaw = grav_y * wy_dps + grav_z * wz_dps;
+            const float off_pitch_mag = sqrtf(wy_dps * wy_dps + wz_dps * wz_dps);
+            const float yaw_sign = (world_yaw >= 0.0f) ? 1.0f : -1.0f;
+            const float player_yaw = yaw_sign * minf(fabsf(world_yaw) * 1.41f, off_pitch_mag);
+            const float turn_yaw_dps = -player_yaw - (wz_dps * prof.roll_mix);
 
-            // 8.2 Speed-Adaptive Low-Pass Filter + Micro-Speed Quadratic Clamping
-            const float raw_speed_dps = sqrtf(raw_yaw_dps * raw_yaw_dps + raw_pitch_dps * raw_pitch_dps);
-            constexpr float kAlphaLow = 0.16f;
-            const float speed_t = smoothstepf(eff_v_low, prof.v_high, raw_speed_dps);
-            const float alpha = kAlphaLow + (1.0f - kAlphaLow) * speed_t;
+            // 6.4 Motion Studio One-Euro Filter + Decay Smoother (cc.rs:205, 231)
+            const float euro_x = one_euro_x.filter(turn_yaw_dps, dt_sec, prof.one_euro_min_cutoff, prof.one_euro_beta);
+            const float euro_y = one_euro_y.filter(local_pitch_dps, dt_sec, prof.one_euro_min_cutoff, prof.one_euro_beta);
 
-            float micro_clamp = 1.0f;
-            if (raw_speed_dps < eff_v_low && eff_v_low > 1e-4f) {
-                const float r_ratio = raw_speed_dps / eff_v_low;
-                micro_clamp = r_ratio * r_ratio; // Quadratic micro-speed attenuation
+            float gx_dps = euro_x;
+            float gy_dps = euro_y;
+            decay_smoother.smooth(euro_x, euro_y, dt_sec, prof.smooth_time_sec, prof.smooth_threshold_dps,
+                                  gx_dps, gy_dps);
+
+            // 6.5 Motion Studio / JSM cutoff_factor (aim.rs:113-121)
+            const float speed_dps = sqrtf(gx_dps * gx_dps + gy_dps * gy_dps);
+            float cutoff_fac = 1.0f;
+            if (prof.cutoff_recovery_dps > prof.cutoff_speed_dps) {
+                cutoff_fac = clampf((speed_dps - prof.cutoff_speed_dps) /
+                                        (prof.cutoff_recovery_dps - prof.cutoff_speed_dps),
+                                    0.0f, 1.0f);
+            } else if (prof.cutoff_speed_dps > 0.0f && speed_dps < prof.cutoff_speed_dps) {
+                cutoff_fac = 0.0f;
             }
+            gx_dps *= cutoff_fac;
+            gy_dps *= cutoff_fac;
 
-            const float clamped_yaw_dps   = raw_yaw_dps * micro_clamp;
-            const float clamped_pitch_dps = raw_pitch_dps * micro_clamp;
+            // 6.6 Motion Studio / XY-CtoPS5 Two-Segment Linear Sensitivity Ramp (aim.rs:733 & mapping.py:195)
+            // Pure 1:1 linear in micro-aim zone (<= min_threshold_dps), smooth linear ramp to max_sens
+            const float post_cutoff_speed = speed_dps * cutoff_fac;
+            const float span_thresh = maxf(prof.max_threshold_dps - prof.min_threshold_dps, 1.0f);
+            const float ramp_t = clampf((post_cutoff_speed - prof.min_threshold_dps) / span_thresh, 0.0f, 1.0f);
+            const float sens_gain = (prof.min_sens + (prof.max_sens - prof.min_sens) * ramp_t) * user_sens_scale;
 
-            filt_yaw_dps   = alpha * clamped_yaw_dps   + (1.0f - alpha) * filt_yaw_dps;
-            filt_pitch_dps = alpha * clamped_pitch_dps + (1.0f - alpha) * filt_pitch_dps;
-
-            // 8.3 Fast-Stop Rebound Damping (40ms >45 deg/s flick -> zero-crossing -> 35ms @ 0.30f)
-            const float filt_speed_dps = sqrtf(filt_yaw_dps * filt_yaw_dps + filt_pitch_dps * filt_pitch_dps);
-            if (filt_speed_dps > 45.0f) {
-                fast_flick_timer_ms = 40.0f;
-                fast_flick_sign_x = (filt_yaw_dps > 4.0f) ? 1 : ((filt_yaw_dps < -4.0f) ? -1 : 0);
-                fast_flick_sign_y = (filt_pitch_dps > 4.0f) ? 1 : ((filt_pitch_dps < -4.0f) ? -1 : 0);
-            } else if (fast_flick_timer_ms > 0.0f) {
-                const bool rev_x = (fast_flick_sign_x != 0) && ((filt_yaw_dps * (float)fast_flick_sign_x) < -0.6f);
-                const bool rev_y = (fast_flick_sign_y != 0) && ((filt_pitch_dps * (float)fast_flick_sign_y) < -0.6f);
-                if (rev_x || rev_y) {
-                    rebound_damp_ms = 35.0f;
-                    fast_flick_timer_ms = 0.0f;
-                }
-            }
-            const float rebound_gain = (rebound_damp_ms > 0.0f) ? 0.30f : 1.0f;
-
-            // 8.4 PD Lead Control Law (with derivative spike clamp against BT packet jitter)
-            const float inv_dt = 1.0f / maxf(dt_sec, 0.0005f);
-            constexpr float kMaxDerivDps2 = 1600.0f;
-            deriv_yaw_dps2   = clampf((filt_yaw_dps   - prev_filt_yaw_dps)   * inv_dt, -kMaxDerivDps2, kMaxDerivDps2);
-            deriv_pitch_dps2 = clampf((filt_pitch_dps - prev_filt_pitch_dps) * inv_dt, -kMaxDerivDps2, kMaxDerivDps2);
-            prev_filt_yaw_dps   = filt_yaw_dps;
-            prev_filt_pitch_dps = filt_pitch_dps;
-
-            const float pd_yaw_dps   = prof.kp_gain * filt_yaw_dps   + prof.kd_lead_sec * deriv_yaw_dps2;
-            const float pd_pitch_dps = prof.kp_gain * filt_pitch_dps + prof.kd_lead_sec * deriv_pitch_dps2;
-
-            // 8.5 R2 Pull 30ms Suppression Envelope & Right-Stick Dynamic Dodge
-            float r2_env_gain = 1.0f;
-            if (r2_suppress_ms > 0.0f) {
-                const float p = 1.0f - (r2_suppress_ms * (1.0f / 30.0f));
-                r2_env_gain = 0.25f + 0.75f * smoothstepf(0.0f, 1.0f, p);
-            }
-
-            const float phys_rx = ((float)r.RightStickX - 128.0f) * (1.0f / 127.0f);
-            const float phys_ry = ((float)r.RightStickY - 128.0f) * (1.0f / 127.0f);
-            const float stick_mag = sqrtf(phys_rx * phys_rx + phys_ry * phys_ry);
-
-            float stick_dodge_gain = 1.0f;
-            if (active_mode == ActivationMode::kAlwaysOnSmartStick) {
-                if (stick_mag > 0.35f) {
-                    stick_dodge_gain = 0.0f;
-                    leaky_yaw_dps = 0.0f;
-                    leaky_pitch_dps = 0.0f;
-                } else {
-                    stick_dodge_gain = 1.0f - smoothstepf(0.22f, 0.35f, stick_mag);
-                }
-            } else {
-                stick_dodge_gain = 1.0f - 0.65f * smoothstepf(0.15f, 0.90f, stick_mag);
-            }
-
-            const float total_gain = user_sens_scale * rebound_gain * r2_env_gain * stick_dodge_gain;
-            const float eff_yaw_dps   = pd_yaw_dps * total_gain;
-            const float eff_pitch_dps = pd_pitch_dps * total_gain * prof.yx_ratio;
-
-            // 8.6 Short-Term Leaky Integrator & Gamma Power Compression
-            const float tau = maxf(prof.leaky_tau_sec, 0.001f);
-            const float leak_decay = tau / (tau + dt_sec);
-            leaky_yaw_dps   = leak_decay * leaky_yaw_dps   + (1.0f - leak_decay) * eff_yaw_dps;
-            leaky_pitch_dps = leak_decay * leaky_pitch_dps + (1.0f - leak_decay) * eff_pitch_dps;
-
-            const float comb_yaw_dps   = 0.78f * eff_yaw_dps   + 0.22f * leaky_yaw_dps;
-            const float comb_pitch_dps = 0.78f * eff_pitch_dps + 0.22f * leaky_pitch_dps;
-            const float comb_speed_dps = sqrtf(comb_yaw_dps * comb_yaw_dps + comb_pitch_dps * comb_pitch_dps);
-
-            if (comb_speed_dps > 1e-4f) {
-                const float u_norm = clampf(comb_speed_dps / prof.full_scale_dps, 0.0f, 1.0f);
-                const float u_gamma = powf(u_norm, prof.gamma);
-
-                // 0 ~ 2.5 deg/s Zero-Crossing Soft Ramp
-                const float zero_ramp = smoothstepf(0.0f, 2.5f, comb_speed_dps);
-                const float adz = prof.anti_deadzone * zero_ramp;
-
-                const float dir_x = comb_yaw_dps / comb_speed_dps;
-                const float dir_y = comb_pitch_dps / comb_speed_dps;
-
-                // 85% Radial + 15% Axial Hybrid Anti-Deadzone
-                const float radial_x = dir_x * (adz * 0.85f);
-                const float radial_y = dir_y * (adz * 0.85f);
-
-                const float axial_ramp_x = smoothstepf(0.0f, 1.5f, fabsf(comb_yaw_dps));
-                const float axial_ramp_y = smoothstepf(0.0f, 1.5f, fabsf(comb_pitch_dps));
-                const float axial_x = ((comb_yaw_dps >= 0.0f) ? 1.0f : -1.0f) * (adz * 0.15f) * axial_ramp_x;
-                const float axial_y = ((comb_pitch_dps >= 0.0f) ? 1.0f : -1.0f) * (adz * 0.15f) * axial_ramp_y;
-
-                const float dyn_span = (prof.max_stick_out - adz) * u_gamma * zero_ramp;
-                cached_out_norm_x = clampf(radial_x + axial_x + dir_x * dyn_span, -prof.max_stick_out, prof.max_stick_out);
-                cached_out_norm_y = clampf(radial_y + axial_y + dir_y * dyn_span, -prof.max_stick_out, prof.max_stick_out);
-            } else {
-                cached_out_norm_x = 0.0f;
-                cached_out_norm_y = 0.0f;
-            }
+            retained_gyro_x_dps = gx_dps * sens_gain;
+            retained_gyro_y_dps = gy_dps * sens_gain * prof.yx_ratio;
         }
-    } else if (gyro_bypass_debug ||
-               active_profile_state == ActiveProfileState::kNone ||
-               shortcut_mute_ms > 0.0f ||
-               touch_landing_mute_ms > 0.0f) {
-        cached_out_norm_x = 0.0f;
-        cached_out_norm_y = 0.0f;
+    } else if (gyro_bypass_debug || active_layer == ActiveLayer::kNone || shortcut_mute_ms > 0.0f) {
+        retained_gyro_x_dps = 0.0f;
+        retained_gyro_y_dps = 0.0f;
     }
 
-    // ---- 9. Superpose onto Physical Right Stick with 2D Circular Clamp (hypot <= 127.0f) ----
-    if (cached_out_norm_x == 0.0f && cached_out_norm_y == 0.0f) {
+    // ---- 7. Motion Studio pad::virtual_stick Rate-Domain Mixer (pad.rs:294-342) ----
+    float gyro_x_dps = retained_gyro_x_dps;
+    float gyro_y_dps = retained_gyro_y_dps;
+
+    // Physical Right Stick in [-1.0 .. +1.0]
+    const float push_x = ((float)r.RightStickX - 128.0f) * (1.0f / 127.0f);
+    const float push_y = ((float)r.RightStickY - 128.0f) * (1.0f / 127.0f);
+    const float push_len = sqrtf(push_x * push_x + push_y * push_y);
+
+    // Mode 3 (kAlwaysOnSmartStick) Smart Stick Clutch: suppress gyro when right stick pushed > 35%
+    if (active_mode == ActivationMode::kAlwaysOnSmartStick) {
+        if (push_len > 0.35f) {
+            gyro_x_dps = 0.0f;
+            gyro_y_dps = 0.0f;
+        } else if (push_len > 0.22f) {
+            const float clutch = 1.0f - smoothstepf(0.22f, 0.35f, push_len);
+            gyro_x_dps *= clutch;
+            gyro_y_dps *= clutch;
+        }
+    }
+
+    // When gyro is completely silent, pass the physical right stick through 100% untouched!
+    if (fabsf(gyro_x_dps) <= 1e-4f && fabsf(gyro_y_dps) <= 1e-4f) {
         return;
     }
 
-    float dx_lsb = ((float)r.RightStickX - 128.0f) + cached_out_norm_x * 127.0f;
-    float dy_lsb = ((float)r.RightStickY - 128.0f) + cached_out_norm_y * 127.0f;
-
-    const float hypot_lsb = sqrtf(dx_lsb * dx_lsb + dy_lsb * dy_lsb);
-    if (hypot_lsb > 127.0f) {
-        const float scale = 127.0f / hypot_lsb;
-        dx_lsb *= scale;
-        dy_lsb *= scale;
+    const float livezone = 1.0f - kGameStickCal.undeadzone_outer - kGameStickCal.undeadzone_inner;
+    if (livezone <= 0.05f || kGameStickCal.calibration_dps <= 1.0f) {
+        return;
     }
 
-    r.RightStickX = (uint8_t)clampf(128.0f + dx_lsb + 0.5f, 0.0f, 255.0f);
-    r.RightStickY = (uint8_t)clampf(128.0f + dy_lsb + 0.5f, 0.0f, 255.0f);
+    // 7.1 Convert physical right-stick push into in-game camera angular velocity (deg/s)
+    float want_x_dps = 0.0f;
+    float want_y_dps = 0.0f;
+    if (push_len > kGameStickCal.undeadzone_inner) {
+        const float norm_push = clampf((push_len - kGameStickCal.undeadzone_inner) / livezone, 0.0f, 1.0f);
+        const float fraction = powf(norm_push, kGameStickCal.unpower);
+        const float stick_speed_dps = fraction * kGameStickCal.calibration_dps;
+        want_x_dps = (push_x / push_len) * stick_speed_dps;
+        want_y_dps = (push_y / push_len) * stick_speed_dps;
+    }
+
+    // 7.2 Add gyro camera rate in the angular velocity domain (deg/s) — zero double-deadzone jump!
+    want_x_dps += gyro_x_dps;
+    want_y_dps += gyro_y_dps;
+
+    const float target_dps = sqrtf(want_x_dps * want_x_dps + want_y_dps * want_y_dps);
+    if (target_dps <= 1e-4f) {
+        return;
+    }
+
+    // 7.3 Convert combined camera rate back into stick travel via inverse unpower & undeadzone_inner
+    float strength = clampf(target_dps / kGameStickCal.calibration_dps, 0.0f, 1.0f);
+    strength = powf(strength, 1.0f / kGameStickCal.unpower);
+
+    float out_mag = kGameStickCal.undeadzone_inner + strength * livezone;
+    // Soft entry across the bottom 1.5% of strength so micro-motions ease onto the deadzone edge smoothly
+    if (push_len <= kGameStickCal.undeadzone_inner && strength < 0.015f) {
+        out_mag *= (strength * (1.0f / 0.015f));
+    }
+    out_mag = minf(out_mag, kGameStickCal.max_stick_out);
+
+    const float dir_x = want_x_dps / target_dps;
+    const float dir_y = want_y_dps / target_dps;
+
+    const float final_x_lsb = clampf(dir_x * out_mag * 127.0f, -127.0f, 127.0f);
+    const float final_y_lsb = clampf(dir_y * out_mag * 127.0f, -127.0f, 127.0f);
+
+    r.RightStickX = (uint8_t)clampf(128.0f + final_x_lsb + 0.5f, 0.0f, 255.0f);
+    r.RightStickY = (uint8_t)clampf(128.0f + final_y_lsb + 0.5f, 0.0f, 255.0f);
 }
