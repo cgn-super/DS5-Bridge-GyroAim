@@ -1,188 +1,93 @@
-# 🎮 DS5-Bridge Gyro-Aim & Two-Stage Adaptive Trigger
+# 🎮 DS5-Bridge Gyro-Aim v2.0 — 250MHz 6-Axis Quaternion & PD Lead Control Firmware
 
-[简体中文](#-简体中文) | [English](#-english) | [日本語](#-日本語) | [Español](#-español) | [Français](#-français)
-
----
-
-## 🇨🇳 简体中文
-
-基于树莓派 Pico 2 W (`RP2350`) 的索尼 PS5 DualSense / DualSense Edge 无线接收器扩展固件。
-
-### 🌟 核心特性与独创机制
-
-1. **虚拟电控“机械二段卡手”段落墙（Two-Stage Adaptive Trigger Wall）**：
-   - 彻底摒弃传统精英手柄在后壳打孔加塑料拨片的粗糙改装方式；
-   - 巧妙利用 DualSense 内部的电控自适应扳机马达，在 L2 行程约 55% 位置（`145 ~ 205`）程序化生成一道 **高强度机械段落阻尼墙**；
-   - **轻按 L2（0 ~ 55%）**：阻尼轻盈，像微单相机“半按对焦”一样进行常规摇杆开镜；
-   - **重按突破阻尼墙（80% ~ 100%，`L2 >= 230`）**：手指清晰感受到“咔哒”击穿机械段落感，手柄灯条秒变**深红锁定指示灯**，瞬时强开底层陀螺仪瞄准！
-   - **松开 L2（`< 200`，带滞后防抖）**：陀螺仪静默，手柄灯条无缝恢复游戏原本的设定颜色。
-
-2. **硬件级右摇杆注入（Gyro-to-Right-Stick）**：
-   - 陀螺仪角速度在芯片固件底层经过 **零偏校准 + 径向软阈值死区 + EMA 指数平滑 + 18% 径向反死区提升** 后，直接加算进原装手柄报告的右摇杆（`RightStickX / RightStickY`）；
-   - 电脑只识别为**唯一一个合法的纯原装有线 PS5 手柄**（`VID: 054C, PID: 0CE6`）；
-   - **零驱动拦截、零软件驻留、不封号**，绝不会出现手柄/鼠标同时输入导致的画面与按键提示符抽搐卡顿！
-
-3. **原生游戏特性 100% 完美无损**：
-   - **HD 触觉反馈（Haptics 细腻震感）** 与手柄扬声器走独立 USB 音频通道，不受任何影响；
-   - **R2 右扳机开火特效** 100% 直通给游戏；
-   - 若进入支持原生 L2 特效的索尼大作，芯片智能识别并让位给游戏；待游戏松开特效后自动挂载二段段落墙。
-
-4. **微星雷影 17 (MSI Alpha 17) 插入自动狂暴风扇 & RAMMap 内存清理 Hook（100% 反作弊安全）**：
-   - **固件内嵌无感 Hook（`host_boost_hook_apply`）**：不增加任何额外 USB 接口，利用标准 HID `0x01` 报告的 `UNK2` 保留字节在手柄连接时及按下 **`L3 + R3 + L1 + R1`** 组合键时发送触发脉冲（手柄灯条闪烁冰蓝色确认）；
-   - **零内核驱动风险**：PC 侧守护脚本 `tools/ds5_msi_auto_boost.py` 直接通过微星原厂正版签名服务 `MSI.CentralServer.exe`（本地 TCP IPC）开启 **Cooler Boost 满速风扇**，绝不加载 `WinRing0` 等高危第三方驱动；
-   - **安全白名单杀后台 + 微软官方 RAMMap 联动**：自动清理高占用闲置后台进程，并调用微软 Sysinternals `RAMMap-64bit.exe` (`-Ew / -Et`) 释放物理内存工作集与备用列表；拔出接收器可自动恢复风扇自动温控。
-
-### 📁 目录结构
-
-* `firmware/`
-  * `ds5-bridge-v0.7.2-gyroL2.uf2`：即刷即用的最终定制固件。
-  * `ds5-bridge-v0.7.2-official-stock.uf2`：官方原版固件，便于随时刷回出厂。
-* `src/`
-  * `gyro_aim.h` & `gyro_aim.cpp`：500Hz 陀螺仪姿态解算、二段阻尼发生器与主机狂暴联动 Hook (`host_boost_hook_apply`) 核心 C++ 源码。
-  * `patch_against_official_v0.7.2.patch`：对官方 `DS5Dongle v0.7.2` 的一键 Git 补丁。
-* `tools/`
-  * `ds5_msi_auto_boost.py` & `start_msi_auto_boost.bat`：微星雷影 17 自动满速风扇 (Cooler Boost) + 杀闲置后台 + RAMMap 物理内存释放守护工具。
-  * `ds5_gyro_stick_check.py`：实时右摇杆与陀螺仪数值检测工具。
-  * `ds5_gyro_hud.html` & `ds5_gyro_mouse_mode_engine.py`：PC 端高精压枪靶场与可视化调参工具。
+基于树莓派 **Raspberry Pi Pico 2 W (`RP2350`)** 的索尼 PS5 DualSense / DualSense Edge 无线接收器 **v2.0 终极体感控制架构固件**。
 
 ---
 
-## 🇬🇧 English
+## 🌟 v2.0 架构核心特性
 
-Custom firmware for Raspberry Pi Pico 2 W (`RP2350`) acting as an ultra-low-latency wireless USB bridge for Sony PlayStation 5 DualSense / DualSense Edge controllers.
-
-### 🌟 Key Innovations & Features
-
-1. **Programmable Two-Stage Adaptive Trigger Wall**:
-   - Replaces crude physical plastic trigger stop switches with DualSense's internal force-feedback servomotors.
-   - Creates a crisp mechanical resistance wall at ~55% trigger travel (`145 ~ 205`).
-   - **Soft Pull (0 ~ 55%)**: Normal smooth trigger stroke for regular thumbstick aiming (similar to half-pressing a camera shutter button to focus).
-   - **Hard Break-Through (80% ~ 100%, `L2 >= 230`)**: Clear tactile "click" sensation breaking past the resistance wall. The lightbar instantly turns **tactical crimson red**, activating 500Hz hardware gyro aiming!
-   - **Release (`< 200`, with hysteresis)**: Disengages gyro aiming and seamlessly restores the in-game lightbar color.
-
-2. **Native Hardware Gyro-to-Right-Stick Fusion**:
-   - The gyro angular rate is processed on-chip via **zero-bias auto-calibration + radial continuous soft deadzone + EMA smoothing + 18% radial anti-deadzone boost**, and added directly to `RightStickX / RightStickY`.
-   - Windows recognizes the device as **a single genuine wired DualSense controller** (`VID: 054C, PID: 0CE6`).
-   - **Zero PC background processes required for aiming, anti-cheat safe, no input flickering** caused by simultaneous gamepad/mouse inputs.
-
-3. **Zero Impact on Native PS5 Controller Features**:
-   - **HD Haptics (dual voice-coil haptic motors)** and controller audio stream untouched through the native USB audio interface.
-   - **R2 trigger effects** remain 100% under the game's control.
-   - When playing official games that send custom L2 adaptive effects, the firmware automatically yields; once the game releases L2, the two-stage wall automatically rearms.
-
-4. **MSI Alpha 17 Auto Cooler Boost & RAMMap Memory Cleaner Hook (100% Anti-Cheat Safe)**:
-   - **In-Band Firmware Hook (`host_boost_hook_apply`)**: Uses the reserved `UNK2` byte in standard HID Input Report `0x01` without adding any extra USB endpoints. Signals on initial controller link and whenever **`L3 + R3 + L1 + R1`** is pressed (with an Ice Cyan lightbar flash).
-   - **Driverless Fan Control & Memory Purge**: `tools/ds5_msi_auto_boost.py` communicates with the official signed `MSI.CentralServer.exe` local TCP IPC to enable maximum fan speed (**Cooler Boost ON**), terminates whitelisted background bloatware, and invokes Microsoft Sysinternals `RAMMap-64bit.exe` (`-Ew / -Et`) to free physical RAM.
+### 1. 底层硬件、250MHz 超频与反作弊安全约束
+- **纯正原装手柄身份（100% 反作弊安全）**：向 PC 呈现为唯一一个合法的**原装有线 DualSense 手柄（`VID: 054C, PID: 0CE6`）**，**零额外 USB Endpoint、零驱动拦截、零常驻瞄准软件**，完美通过 EAC / BattlEye / Vanguard 等内核级反作弊检测，绝无键鼠/手柄图标闪烁冲突。
+- **250MHz 安全超频与单精度 FPU 加速**：
+  - 调用 `set_sys_clock_khz(250000, true)`（配合 `VREG_VOLTAGE_1_20`、`PICO_FLASH_SPI_CLKDIV = 2` 与 `CYW43_PIO_CLOCK_DIV = 3`），将 RP2350 双核 Cortex-M33 稳定超频至 **250 MHz**，蓝牙与 HD 触觉音频零爆音；
+  - 全部控制律严格使用 `float` 单精度硬件 FPU 指令（`sqrtf`, `powf`, `fabsf`），驻留 SRAM `.time_critical` 段（`__not_in_flash_func`），**零动态内存分配（0 Heap Allocations）**；
+  - 默认保持 **`500Hz`（`bInterval = 2`）** 低抖动 USB HID 报告轮询率。
+- **原生特性 100% 无损透传**：USB 四声道音频的 **HD 触觉反馈（Haptics）**、手柄扬声器、**R2 原生自适应扳机特效** 以及**物理按下触摸板按键（`ButtonPad` 打开地图）** 100% 原样直通。
+- **微星雷影 17 (MSI Alpha 17) 狂暴散热与内存清理联动 Hook**：完整保留 `host_boost_hook_apply`，在连接建立及按下 **`L3 + R3 + L1 + R1`** 时通过 HID `0x01` 报告 `UNK2` 保留字节发送触发脉冲并闪烁冰蓝色灯条。
 
 ---
 
-## 🇯🇵 日本語
+### 2. 四种体感激活模式与 `Create + D-Pad` 在线热切换
 
-Raspberry Pi Pico 2 W (`RP2350`) を使用し、PS5 DualSense / DualSense Edge コントローラーを PC で超低遅延ワイヤレス接続するための高機能カスタムファームウェアです。
+无需重刷固件或打开任何上位机，游戏中随时使用 **`Create (Share) + 十字键`** 切换模式与调节灵敏度（触发时自动吞掉组合键、静默体感 `80ms` 并清零积分/微分历史）：
 
-### 🌟 主な特徴と革新技術
+| 快捷键 | 功能说明 | 灯条反馈 |
+| :--- | :--- | :--- |
+| **`Create + D-Pad Up / Down`** | 循环切换 4 种 `ActivationMode`（Mode 1 ~ Mode 4） | 闪烁对应模式颜色 `300ms` |
+| **`Create + D-Pad Left / Right`** | 以 `0.10f` 步进实时调节总灵敏度倍率 `user_sens_scale`（`0.50f ~ 2.00f`） | 闪烁纯白光 `220ms` |
+| **`L3 + R3 + L1 + R1`** | 触发 PC 端 MSI Cooler Boost 满速风扇 & RAMMap 内存清理 | 闪烁冰青蓝 `600ms` |
 
-1. **電子制御式 2段階アダプティブトリガー・ウォール（Two-Stage Wall）**：
-   - 従来のエリートコントローラーのように物理的なストッパー改造を施すことなく、DualSense 内蔵のモーターを活用して L2 トリガーの約 55%（`145 ~ 205`）に明確な**機械的クリック感（段落抵抗）**を生成します。
-   - **浅押し（0 〜 55%）**：カメラの「半押しAF」のようにスムーズな通常エイム操作。
-   - **押し込み突破（80 〜 100%、`L2 >= 230`）**：抵抗をカチッと押し抜けると、ライトバーが即座に**深紅（ロックオン）**に変化し、500Hz の超低遅延ジャイロエイムが発動！
-   - **リリース（`< 200`、ヒステリシス制御）**：ジャイロがオフになり、ゲーム本来の LED カラーへ自動復帰。
-
-2. **ハードウェア直接マッピング（ジャイロ → 右スティック）**：
-   - 取得した角速度は、マイコン内部で**ゼロ点自動補正 ＋ 連続ソフトデッドゾーン ＋ EMA スムージング ＋ 18% ラジアル反デッドゾーン補正**を経て、右スティック（`RightStickX / RightStickY`）へ直接合成されます。
-   - PC 側からは**正真正銘の純正 PS5 有線コントローラー**として認識されます。
-   - **チート対策（アンチチート）安全・ゲーム内のキーマウ/パッド表示のチラつきなし**！
-
-3. **PS5 純正機能（HDハプティクス / トリガー）との完全両立**：
-   - **HD ハプティクス（繊細な触覚振動）**やコントローラースピーカーは独立した USB オーディオ経路を通るため、一切劣化しません。
-   - **R2（射撃トリガー）**のゲーム側エフェクトは 100% そのまま機能します。
-
-4. **MSI Alpha 17 自動 Cooler Boost ＆ RAMMap メモリ解放フック**：
-   - 接続時および **`L3 + R3 + L1 + R1`** 同時押し時に、MSI 公式 IPC 経由でファンを最大回転（Cooler Boost）に切り替え、Microsoft 公式 `RAMMap` と連携して物理メモリを自動解放します。
+#### 四种激活模式（`ActivationMode`）详解：
+1. **Mode 1：`kCombatAndGrenade`（默认，翠绿灯提示）**
+   - `L2 >= 30` 或 `R2 >= 30`（滞回释放 `< 18`，无阻力墙）轻触即激活枪械精瞄档 `kCombatProfile`；
+   - 长按 `○` 键（`>= 80ms`，松开后含 `150ms` 尾迹缓冲）或举枪下挂榴弹态自动无缝切入广域抛物线档 `kGrenadeProfile`；
+   - 全局启用右半区触摸板电容轻触映射 `R3`。
+2. **Mode 2：`kSoftL2Only`（宝蓝灯提示）**
+   - 仅在 `L2 >= 30`（释放 `< 18`）轻触开镜时激活体感，无扳机阻力墙，腰射 `R2` 不触发体感。
+3. **Mode 3：`kAlwaysOnSmartStick`（琥珀黄灯提示）**
+   - 常开体感瞄准 + **右摇杆智能离合**：当大拇指大幅推右摇杆转视角（模长 `> 35%`）时自动将体感抑制为 `0` 并清零漏积分器。
+4. **Mode 4：`kClassicTwoStage`（深红灯提示）**
+   - 经典 v0.7.2 电控二段阻尼墙：在 L2 行程 `145 ~ 205` 生成高强度机械段落阻尼墙，轻按常规摇杆开镜，重按突破阻尼墙（`L2 >= 230`）灯条变深红并开启体感。
 
 ---
 
-## 🇪🇸 Español
+### 3. 全局右半区触摸板电容映射 `R3` 与上下文化下挂榴弹联动
 
-Firmware personalizado para Raspberry Pi Pico 2 W (`RP2350`) que funciona como un puente inalámbrico USB de latencia ultra baja para mandos Sony PS5 DualSense / DualSense Edge en PC.
-
-### 🌟 Innovaciones y Características Principales
-
-1. **Muro de Resistencia Mecánica de Dos Etapas en L2 (Two-Stage Adaptive Trigger)**:
-   - Elimina la necesidad de modificaciones físicas o topes de plástico en el gatillo. Utiliza los servomotores de retroalimentación de fuerza del propio DualSense para generar un muro mecánico configurable al ~55% del recorrido (`145 ~ 205`).
-   - **Pulsación Suave (0 ~ 55%)**: Recorrido suave para apuntado tradicional con el stick (similar al enfoque de media pulsación en cámaras).
-   - **Pulsación Fuerte / Ruptura (80% ~ 100%, `L2 >= 230`)**: Se supera la resistencia física con una sensación de "clic" mecánico. La barra de luz cambia inmediatamente a **rojo carmesí táctico**, activando el apuntado giroscópico a 500 Hz en tiempo real.
-   - **Liberación (`< 200`, con histéresis)**: Desactiva el giroscopio y restaura automáticamente el color RGB original del juego.
-
-2. **Fusión de Giroscopio a Stick Derecho en Hardware (Gyro-to-Right-Stick)**:
-   - La velocidad angular del giroscopio se filtra en el propio chip con **calibración de deriva cero + zona muerta radial suave + suavizado EMA + compensación de zona muerta del 18%**, inyectándose directamente en `RightStickX / RightStickY`.
-   - El PC detecta el dispositivo como un **mando DualSense original con cable** (`VID: 054C, PID: 0CE6`).
-   - **Seguro contra antitrampas (anti-cheat safe) y sin parpadeos de interfaz** por conflicto entre ratón y mando.
-
-3. **Compatibilidad Total con Funciones Nativas**:
-   - La **vibración háptica HD** y el altavoz del mando pasan intactos por la interfaz de audio USB nativa.
-   - El gatillo derecho **R2** mantiene íntegros todos los efectos adaptativos del juego.
-
-4. **Hook Automático de Cooler Boost (MSI Alpha 17) y Limpieza de Memoria RAMMap**:
-   - Activa automáticamente los ventiladores al máximo (Cooler Boost) mediante el IPC oficial de MSI Center y libera memoria RAM física con Microsoft `RAMMap` al conectar el receptor o pulsar **`L3 + R3 + L1 + R1`**.
+- **右半区防误触识别**：解析 `0x31` 报告第一触点接触位与 12-bit `X` 坐标（`0 ~ 1919`）；仅当手指接触 **右半区（`X >= 960`）** 时触发（防止左手推左摇杆时虎口误触左半区）。
+- **轻触即按 `R3`（锁定 / 处决 / 近战）**：无需费力按压摇杆帽，右手拇指轻触右半区触摸板即输出 `R3`（内置 `50ms` 最小保底脉冲，与物理 `R3` 逻辑或合并；物理按下触摸板按键仍正常打开地图）。
+- **`60ms` 落指防抖静默**：每次轻触右触摸板上升沿自动静默陀螺仪输出 `60ms`，彻底吸收拇指移向触摸板瞬间的手部微颤。
+- **上下文化下挂榴弹联动**：
+  - **未按 `L2` 时**轻触右触摸板：仅触发 `R3`（锁定敌人或处决）；
+  - **按住 `L2 >= 30`（举枪开镜状态）时**轻触右触摸板：触发 `R3` 切换下挂榴弹的同时，自动翻转 `underbarrel_gl_active` 状态，将体感无缝切换为高仰角抛物线档 `kGrenadeProfile`（松开 `L2 < 18` 退出举枪时自动复位为常规枪械档）。
 
 ---
 
-## 🇫🇷 Français
+### 4. 双物理量纲档案与 6 轴四元数 + PD 超前控制律
 
-Firmware sur mesure pour Raspberry Pi Pico 2 W (`RP2350`) servant de pont sans fil USB à ultra-faible latence pour les manettes Sony PS5 DualSense / DualSense Edge sur PC.
+#### 预设双档案参数（定义于 `src/gyro_aim.h`）：
 
-### 🌟 Innovations et Fonctionnalités Clés
+| 参数字段 | `kCombatProfile`（枪械精确瞄准档） | `kGrenadeProfile`（手雷/下挂榴弹广域档） | 物理意义 |
+| :--- | :---: | :---: | :--- |
+| `full_scale_dps` | `160.0f °/s` | `95.0f °/s` | 满量程角速度基准 |
+| `yx_ratio` | `0.60f` | `0.95f` | 垂直(Pitch)相对水平(Yaw)灵敏度比 |
+| `gamma` | `0.70f` | `0.75f` | 逆响应曲线幂次压缩指数 |
+| `kp_gain` | `1.00f` | `1.00f` | 比例主增益 |
+| `kd_lead_sec` | `0.018f s` | `0.012f s` | PD 微分超前时间常数（击穿镜头平滑惯性） |
+| `v_low` / `v_high` | `1.5f` / `15.0f °/s` | `0.4f` / `8.0f °/s` | 微速强低通二次钳制上限 / 零延迟直通下限 |
+| `anti_deadzone` | `0.12f` | `0.12f` | 85% 径向 + 15% 轴向混合反死区比例 |
+| `leaky_tau_sec` | `0.045f s` | `0.035f s` | 短时角度误差漏积分器衰减时间常数 |
+| `max_stick_out` | `0.84f` | `0.92f` | 最大摇杆占空上限（避开游戏 85%+ 外圈加速陷阱） |
 
-1. **Mur de Résistance Électromécanique à Deux Paliers sur L2**:
-   - Remplace les butées physiques en plastique grossières en exploitant les servomoteurs de retour d'effort internes de la DualSense. Génère un mur de résistance mécanique net à environ 55% de course (`145 ~ 205`).
-   - **Pression Légère (0 ~ 55%)**: Course fluide pour la visée traditionnelle au joystick (similaire au déclencheur à mi-course d'un appareil photo).
-   - **Franchissement Franc (80% ~ 100%, `L2 >= 230`)**: Sensation de clic mécanique en franchissant le mur. La barre lumineuse passe instantanément au **rouge écarlate tactique**, activant la visée gyroscopique matérielle à 500 Hz.
-   - **Relâchement (`< 200`, avec hystérésis)**: Coupe le gyroscope et rétablit instantanément la couleur LED originale définie par le jeu.
-
-2. **Injection Matérielle du Gyroscope vers le Joystick Droit**:
-   - La vitesse angulaire du gyroscope est traitée directement sur le microcontrôleur via **autocalibrage du biais zéro + zone morte radiale progressive + lissage EMA + compensation de zone morte de 18%**, puis injectée dans `RightStickX / RightStickY`.
-   - Windows ne voit qu'une **authentique manette filaire officielle DualSense** (`VID: 054C, PID: 0CE6`).
-   - **Sans risque de ban anti-triche, et aucune saccade d'interface** causée par un conflit manette/souris.
-
-3. **Préservation Totale des Technologies PS5 Natives**:
-   - Les **retours haptiques HD** et le haut-parleur intégré sont préservés à 100% via le canal audio USB dédié.
-   - La gâchette droite **R2** conserve intacts tous les effets de tir envoyés par le jeu.
-
-4. **Hook Automatique Cooler Boost (MSI Alpha 17) & Purge Mémoire RAMMap**:
-   - Déclenche automatiquement la vitesse maximale des ventilateurs via l'IPC officiel MSI Center et libère la mémoire vive avec Microsoft `RAMMap` dès la connexion ou via le raccourci **`L3 + R3 + L1 + R1`**.
+#### 控制律核心管线（实现于 `src/gyro_aim.cpp`）：
+1. **3MHz 硬件时钟 $\Delta t$ 与 `0x05` 出厂校准**：解析 `SensorTimestamp` 精确计算每帧 $\Delta t \in [0.0005\text{s}, 0.02\text{s}]$；零拷贝读取 `Feature Report 0x05` 出厂标定参数，配合 `0.6s` 滑动静止窗口持续收敛温漂 Bias。
+2. **最短弧四元数正交玩家空间（$q_{\text{align}}$）**：仅在 $\|\mathbf{a}\| \in [0.85g, 1.15g]$ 时按可信度加权互补滤波跟踪重力向量 $\hat{\mathbf{g}}$，求解旋转至竖直轴 $(0, 1, 0)$ 的最短弧四元数 $q_{\text{align}}$，消除任意握持俯仰角下的 Yaw/Roll 串扰。
+3. **壳体振动抑制 + 急停回弹阻尼 + R2 扣扳机微抑制**：
+   - 实时监测高频角加速度能量，在马达强烈震动时自动收紧 `v_low`；
+   - `40ms` 内出现 `> 45 °/s` 高速甩枪且随后过零反向时，启动 `35ms` `0.30f` 急停回弹阻尼，吞掉肌腱回弹；
+   - `R2` 跨过 `45` 上升沿启动 `30ms` `0.25f` 恢复包络，消除第一枪扣扳机震偏。
 
 ---
 
-## 🛠️ Build & Compile / 编译指南
+## 🛠️ 编译与实时遥测验证
 
+### 1. 一键本地编译（WSL2 Ubuntu）
 ```bash
-git clone https://github.com/awalol/DS5Dongle.git
-cd DS5Dongle
-git checkout v0.7.2-hotfix
-git submodule update --init --recursive
-
-# Apply our custom gyro & two-stage trigger patch
-git apply patch_against_official_v0.7.2.patch
-
-# Build using Ninja & ARM Toolchain
-cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
-cmake --build build -j 16
+wsl bash /mnt/c/Users/cgnnb/.gemini/antigravity/scratch/DS5-Bridge-GyroAim/build_firmware.sh
 ```
+编译产物自动输出至：`firmware/ds5-bridge-v0.7.2-gyroL2.uf2`。
 
-## 🚀 MSI Alpha 17 (微星雷影17) 自动风扇 & 内存清理守护用法
-
+### 2. 实时遥测与按键/触摸板校验
 ```powershell
-# 方式 1：直接双击运行（自动申请管理员权限以支持 RAMMap 静默释放内存，拔出接收器自动恢复风扇温控）
-tools\start_msi_auto_boost.bat
-
-# 方式 2：终端单次立即执行（风扇拉满 6486 RPM + 杀闲置后台 + RAMMap 清理后退出）
-python tools\ds5_msi_auto_boost.py --once --uac-rammap
-
-# 方式 3：将风扇恢复为自动温控模式 (Cooler Boost OFF)
-python tools\ds5_msi_auto_boost.py --fan-auto
+python tools/ds5_gyro_stick_check.py
 ```
-
-## 📜 License / 开源协议
-
-Released under the **MIT License**. Based upon and derived from [awalol/DS5Dongle](https://github.com/awalol/DS5Dongle).
+可实时观测 `L2/R2`、`RX/RY`、6 轴 `Gyro/Accel`、右半区触摸板 `R-HALF(R3)` 坐标触发、`O-GRENADE` 状态及 `BOOST` 脉冲。

@@ -1,4 +1,4 @@
-name: Build Gyro-Aim Firmware (RP2350)
+name: Build Gyro-Aim v2.0 Firmware (RP2350 @ 250MHz)
 
 on:
   push:
@@ -15,11 +15,12 @@ permissions:
 
 jobs:
   build:
-    name: Compile Pico 2 W (.uf2)
+    name: Compile Pico 2 W v2.0 (.uf2)
     runs-on: ubuntu-latest
 
     env:
       PICO_SDK_REF: "2.3.1"
+      TINYUSB_REF: "98741b55959564746998d0453c32d87064629d7c"
       ARM_TOOLCHAIN_URL: "https://gitlab.arm.com/api/v4/projects/tooling%2Fgnu-toolchains-for-arm/packages/generic/gnu-toolchain/15.2.rel1/arm-gnu-toolchain-15.2.rel1-x86_64-arm-none-eabi.tar.xz"
       ARM_TOOLCHAIN_PATH: "${{ github.workspace }}/arm-toolchain"
       PICO_SDK_PATH: "${{ github.workspace }}/pico-sdk"
@@ -46,7 +47,6 @@ jobs:
         if: steps.cache-toolchain.outputs.cache-hit != 'true'
         run: |
           mkdir -p "$ARM_TOOLCHAIN_PATH"
-          echo "Downloading ARM Toolchain from $ARM_TOOLCHAIN_URL..."
           curl -sSL "$ARM_TOOLCHAIN_URL" -o arm-toolchain.tar.xz
           tar -xf arm-toolchain.tar.xz -C "$ARM_TOOLCHAIN_PATH" --strip-components=1
           rm arm-toolchain.tar.xz
@@ -55,63 +55,29 @@ jobs:
         run: |
           echo "$ARM_TOOLCHAIN_PATH/bin" >> $GITHUB_PATH
 
-      - name: Verify Toolchain
-        run: |
-          arm-none-eabi-gcc --version
-          cmake --version
-          ninja --version
-
-      - name: Clone Raspberry Pi Pico SDK
+      - name: Clone Raspberry Pi Pico SDK & Pin TinyUSB
         run: |
           git clone --depth 1 --branch "$PICO_SDK_REF" https://github.com/raspberrypi/pico-sdk.git "$PICO_SDK_PATH"
-          git -C "$PICO_SDK_PATH" submodule update --init --recursive
+          for m in lib/tinyusb lib/cyw43-driver lib/btstack lib/lwip; do
+            git -C "$PICO_SDK_PATH" submodule update --init --depth 1 "$m"
+          done
+          git -C "$PICO_SDK_PATH/lib/tinyusb" fetch --depth 1 origin "$TINYUSB_REF"
+          git -C "$PICO_SDK_PATH/lib/tinyusb" checkout --detach FETCH_HEAD
 
       - name: Clone Upstream DS5Dongle (v0.8.0)
         run: |
-          git clone --depth 1 --branch v0.8.0 https://github.com/awalol/DS5Dongle.git ds5dongle
-          git -C ds5dongle submodule update --init --recursive
+          git clone --depth 1 --branch v0.8.0 --recurse-submodules --shallow-submodules https://github.com/awalol/DS5Dongle.git ds5dongle
 
-      - name: Inject Custom Gyro-Aim Algorithm & Patch
+      - name: Inject Gyro-Aim v2.0 & 250MHz Overclock Patch
         shell: bash
         run: |
-          # Copy custom gyro algorithm sources into DS5Dongle tree
           cp gyro-aim-repo/src/gyro_aim.cpp ds5dongle/src/
           cp gyro-aim-repo/src/gyro_aim.h ds5dongle/src/
-
           cd ds5dongle
-
-          # Attempt clean patch first; fallback to deterministic Python injection
-          if git apply --whitespace=fix ../gyro-aim-repo/src/patch_against_official_v0.7.2.patch 2>/dev/null; then
-            echo "git apply succeeded cleanly!"
-          else
-            echo "git apply failed, performing robust Python AST-string injection..."
-            python3 - << 'EOF'
-          # 1. Update CMakeLists.txt
-          with open("CMakeLists.txt", "r", encoding="utf-8") as f:
-              cmake = f.read()
-          if "src/gyro_aim.cpp" not in cmake:
-              cmake = cmake.replace("src/button_remap.cpp", "src/button_remap.cpp\n        src/gyro_aim.cpp")
-              with open("CMakeLists.txt", "w", encoding="utf-8") as f:
-                  f.write(cmake)
-              print("Injected gyro_aim.cpp into CMakeLists.txt")
-
-          # 2. Update src/main.cpp
-          with open("src/main.cpp", "r", encoding="utf-8") as f:
-              main_cpp = f.read()
-          if "gyro_aim.h" not in main_cpp:
-              main_cpp = main_cpp.replace('#include "button_remap.h"', '#include "button_remap.h"\n#include "gyro_aim.h"')
-              main_cpp = main_cpp.replace('button_remap_apply(report);', 'button_remap_apply(report);\n        gyro_aim_apply(report);')
-              main_cpp = main_cpp.replace('memcpy(outputData + 3, &state, sizeof(SetStateData));', 'gyro_aim_on_host_output_report(state);\n    memcpy(outputData + 3, &state, sizeof(SetStateData));')
-              with open("src/main.cpp", "w", encoding="utf-8") as f:
-                  f.write(main_cpp)
-              print("Injected gyro_aim hooks into src/main.cpp")
-          EOF
-          fi
-
-          # Show git diff to confirm injection is 100% correct
+          git apply --whitespace=fix ../gyro-aim-repo/src/patch_against_official_v0.7.2.patch
           git diff
 
-      - name: Compile RP2350 Firmware (Ninja Release)
+      - name: Compile RP2350 v2.0 Firmware (Ninja Release)
         shell: bash
         run: |
           cd ds5dongle
@@ -121,14 +87,19 @@ jobs:
 
           cmake --build build --target ds5-bridge -j$(nproc)
 
-          # Prepare output folder
+          # Verify zero dynamic memory allocation in gyro_aim.cpp.o
+          if arm-none-eabi-nm -u build/CMakeFiles/ds5-bridge.dir/src/gyro_aim.cpp.o | grep -E "malloc|free|realloc|calloc|_Znw|_Zdl|_Zna|_Zda"; then
+            echo "ERROR: Dynamic memory allocation symbols found in gyro_aim.cpp.o!"
+            exit 1
+          fi
+
           mkdir -p ../output
-          cp build/ds5-bridge.uf2 ../output/ds5-bridge-v0.7.2-gyroL2-flydigi-grade.uf2
           cp build/ds5-bridge.uf2 ../output/ds5-bridge-v0.7.2-gyroL2.uf2
+          cp build/ds5-bridge.uf2 ../output/ds5-bridge-v0.8.0-gyroL2-new.uf2
 
       - name: Upload UF2 Firmware as Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: DS5-Bridge-GyroAim-v0.7.2-RP2350
+          name: DS5-Bridge-GyroAim-v2.0-RP2350-250MHz
           path: output/*.uf2
           if-no-files-found: error
